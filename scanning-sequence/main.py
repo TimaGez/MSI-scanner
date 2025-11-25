@@ -1,48 +1,50 @@
 import RPi.GPIO as gpio
 import time
+from picamera2 import Picamera2
 
-gpio.setmode(gpio.BOARD)
+gpio.setmode(gpio.BCM)
 
 pins = {
-    "n450_p1": 1,
-    "n450_p2": 2,
-    "j660_p1": 3,
-    "j660_p2": 4,
-    "g730_p1": 5,
-    "g730_p2": 6,
-    "k850_p1": 7,
-    "k850_p2": 8,
-    "j940_p1": 9,
-    "h940_p2": 10
+    "n450": 1,
+    "j660": 2,
+    "g730": 3,
+    "k850": 4,
+    "h940": 5
 }
 
-for k in pins.values():
-    gpio.setup(k, gpio.OUT)
+def init():
+	for k in pins.values():
+    	gpio.setup(k, gpio.OUT)
 
-screen_input = False
+	cam = Picamera2()
 
-if screen_input:
-    gpio.output(pins["n450_p1"], gpio.HIGH)
-    gpio.output(pins["n450_p2"], gpio.HIGH)
+def sequence():
+    gpio.output(pins["n450"], gpio.HIGH)
+    time.sleep(.1)
+    cam.start_and_capture_file("test1.jpg")
+    time.sleep(.1)
+    gpio.output(pins["n450"], gpio.LOW)
+
+    gpio.output(pins["j660"], gpio.HIGH)
     time.sleep(.1)
     # camera.take_snapshot()
     time.sleep(.1)
-    gpio.output(pins["n450_p1"], gpio.LOW)
-    gpio.output(pins["n450_p2"], gpio.LOW)
+    gpio.output(pins["j660"], gpio.LOW)
 
-    gpio.output(pins.get("j660_p1"), gpio.HIGH)
-    gpio.output(pins.get("j660_p2"), gpio.HIGH)
+    gpio.output(pins["g730"], gpio.HIGH)
     time.sleep(.1)
     # camera.take_snapshot()
     time.sleep(.1)
-    gpio.output(pins.get("j660_p1"), gpio.LOW)
-    gpio.output(pins.get("j660_p2"), gpio.LOW)
+    gpio.output(pins["g730"], gpio.LOW)
 
-    gpio.output(pins.get("j660_p1"), gpio.HIGH)
-    gpio.output(pins.get("j660_p2"), gpio.HIGH)
-    time.sleep(.1)
-    # camera.take_snapshot()
-    time.sleep(.1)
-    gpio.output(pins.get("j660_p1"), gpio.LOW)
-    gpio.output(pins.get("j660_p2"), gpio.LOW)
-    
+	gpio.output(pins["k850"], gpio.HIGH)
+	time.sleep(.1)
+	# camera.take_snapshot()
+	time.sleep(.1)
+	gpio.output(pins["k850"], gpio.LOW)
+
+	gpio.output(pins["h940"], gpio.HIGH)
+	time.sleep(.1)
+	# camera.take_snapshot()
+	time.sleep(.1)
+	gpio.output(pins["h940"], gpio.LOW)

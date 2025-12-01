@@ -5,6 +5,7 @@ import smbus2
 from luma.core.interface.serial import spi
 from luma.lcd.device import st7789
 from luma.core.render import canvas
+from datetime import date
 
 gpio.setmode(gpio.BCM)
 
@@ -24,35 +25,40 @@ time.sleep(.2)
 for k in pins.values():
 	gpio.setup(k, gpio.OUT)
 
+counter = 0
+day = date.today()
 
 def sequence():
+	global counter
+	global day
+	counter += 1
 	gpio.output(pins["n450"], gpio.HIGH)
 	time.sleep(.1)
-	cam.capture_file("test1.jpg")
+	cam.capture_file(f"{day}-{counter}-450nm.jpg")
 	time.sleep(.1)
 	gpio.output(pins["n450"], gpio.LOW)
 
 	gpio.output(pins["j660"], gpio.HIGH)
 	time.sleep(.1)
-	cam.capture_file("test2.jpg")
+	cam.capture_file(f"{day}-{counter}-660nm.jpg")
 	time.sleep(.1)
 	gpio.output(pins["j660"], gpio.LOW)
 
 	gpio.output(pins["g730"], gpio.HIGH)
 	time.sleep(.1)
-	cam.capture_file("test3.jpg")
+	cam.capture_file(f"{day}-{counter}-730nm.jpg")
 	time.sleep(.1)
 	gpio.output(pins["g730"], gpio.LOW)
 
 	gpio.output(pins["k850"], gpio.HIGH)
 	time.sleep(.1)
-	cam.capture_file("test4.jpg")
+	cam.capture_file(f"{day}-{counter}-850nm.jpg")
 	time.sleep(.1)
 	gpio.output(pins["k850"], gpio.LOW)
 	
 	gpio.output(pins["h940"], gpio.HIGH)
 	time.sleep(.1)
-	cam.capture_file("test5.jpg")
+	cam.capture_file(f"{day}-{counter}-940nm.jpg")
 	time.sleep(.1)
 	gpio.output(pins["h940"], gpio.LOW)
 

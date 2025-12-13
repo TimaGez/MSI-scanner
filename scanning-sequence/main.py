@@ -28,19 +28,35 @@ cam = Picamera2()
 cam.configure(cam.create_still_configuration())
 cam.start()
 
-# --- camera stability (minimal + reliable) ---
-time.sleep(1.0)  # let AE/AWB settle
-meta = cam.capture_metadata()
-exp = meta.get("ExposureTime", 4000)     # microseconds fallback
-gain = meta.get("AnalogueGain", 1.0)
+# --- camera stability ---
+time.sleep(1.0)  # let the pipeline settle
+cam.set_controls({"AeEnable": False, "AwbEnable": False})  # keep autos OFF always
+# -----------------------
 
-cam.set_controls({
-    "AeEnable": False,
-    "AwbEnable": False,
-    "ExposureTime": int(exp),
-    "AnalogueGain": float(gain),
-})
-# --------------------------------------------
+# Per-capture exposure settings (tune these numbers if needed)
+CAPTURE_SETTINGS = {
+    "still": {"ExposureTime": 2500, "AnalogueGain": 1.0},
+
+    # Visible: usually needs SHORT exposure to avoid blowing out
+    "450":  {"ExposureTime": 300,  "AnalogueGain": 1.0},
+    "660":  {"ExposureTime": 400,  "AnalogueGain": 1.0},
+
+    # NIR: usually needs longer exposure (NoIR response varies a lot)
+    "730":  {"ExposureTime": 2500, "AnalogueGain": 1.5},
+    "850":  {"ExposureTime": 6000, "AnalogueGain": 2.0},
+    "940":  {"ExposureTime": 12000, "AnalogueGain": 2.5},
+}
+
+def apply_capture_settings(key: str) -> None:
+    s = CAPTURE_SETTINGS[key]
+    cam.set_controls({
+        "AeEnable": False,
+        "AwbEnable": False,
+        "ExposureTime": int(s["ExposureTime"]),
+        "AnalogueGain": float(s["AnalogueGain"]),
+        "Saturation": 0.0,  # helps avoid “solid color wash” look; safe for analysis
+    })
+
 
 serial = i2c(port=1, address=0x3C)
 device = ssd1306(serial, width=128, height=64)
@@ -53,13 +69,13 @@ font = ImageFont.load_default()
 day = date.today()
 last_state = gpio.input(button_pin)
 
-# A "scan" is TWO presses: (1) still, (2) multispectral sequence
-scan_counter = 0          # increments only after the scan sequence completes
-press_counter = 0         # increments on every valid button press
-current_scan_dir = None   # folder for the current still+scan pair
+scan_counter = 0
+press_counter = 0
+current_scan_dir = None
 
 LED_SETTLE = 0.25
 LED_OFF_GAP = 0.05
+CTRL_SETTLE = 0.05  # small delay after changing exposure controls
 
 
 def _ensure_dir(path: str) -> None:
@@ -67,7 +83,6 @@ def _ensure_dir(path: str) -> None:
 
 
 def _new_scan_dir(scan_num: int) -> str:
-    # Folder name groups the two-press pair (still + 5-band scan)
     timestamp = datetime.now().strftime("%H%M%S")
     folder = f"{day}-scan{scan_num:03d}-{timestamp}"
     _ensure_dir(folder)
@@ -75,6 +90,8 @@ def _new_scan_dir(scan_num: int) -> str:
 
 
 def take_still(scan_dir: str, scan_num: int) -> None:
+    apply_capture_settings("still")
+    time.sleep(CTRL_SETTLE)
     cam.capture_file(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-still.jpg"))
 
 
@@ -82,6 +99,8 @@ def sequence(scan_dir: str, scan_num: int) -> None:
     # 450 nm
     gpio.output(pins["n450"], gpio.HIGH)
     time.sleep(LED_SETTLE)
+    apply_capture_settings("450")
+    time.sleep(CTRL_SETTLE)
     cam.capture_file(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-450nm.jpg"))
     gpio.output(pins["n450"], gpio.LOW)
     time.sleep(LED_OFF_GAP)
@@ -89,6 +108,8 @@ def sequence(scan_dir: str, scan_num: int) -> None:
     # 660 nm
     gpio.output(pins["j660"], gpio.HIGH)
     time.sleep(LED_SETTLE)
+    apply_capture_settings("660")
+    time.sleep(CTRL_SETTLE)
     cam.capture_file(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-660nm.jpg"))
     gpio.output(pins["j660"], gpio.LOW)
     time.sleep(LED_OFF_GAP)
@@ -96,6 +117,8 @@ def sequence(scan_dir: str, scan_num: int) -> None:
     # 730 nm
     gpio.output(pins["g730"], gpio.HIGH)
     time.sleep(LED_SETTLE)
+    apply_capture_settings("730")
+    time.sleep(CTRL_SETTLE)
     cam.capture_file(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-730nm.jpg"))
     gpio.output(pins["g730"], gpio.LOW)
     time.sleep(LED_OFF_GAP)
@@ -103,6 +126,8 @@ def sequence(scan_dir: str, scan_num: int) -> None:
     # 850 nm
     gpio.output(pins["k850"], gpio.HIGH)
     time.sleep(LED_SETTLE)
+    apply_capture_settings("850")
+    time.sleep(CTRL_SETTLE)
     cam.capture_file(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-850nm.jpg"))
     gpio.output(pins["k850"], gpio.LOW)
     time.sleep(LED_OFF_GAP)
@@ -110,6 +135,8 @@ def sequence(scan_dir: str, scan_num: int) -> None:
     # 940 nm
     gpio.output(pins["h940"], gpio.HIGH)
     time.sleep(LED_SETTLE)
+    apply_capture_settings("940")
+    time.sleep(CTRL_SETTLE)
     cam.capture_file(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-940nm.jpg"))
     gpio.output(pins["h940"], gpio.LOW)
     time.sleep(LED_OFF_GAP)
@@ -122,25 +149,18 @@ def main():
         while True:
             state = gpio.input(button_pin)
 
-            # detect press edge
             if state == gpio.LOW and last_state == gpio.HIGH:
                 press_counter += 1
-
-                # NEXT scan number is scan_counter+1 (because scan_counter increments only after full scan)
                 next_scan_num = scan_counter + 1
 
                 if press_counter % 2 == 1:
-                    # on odd press, create folder + take still
                     current_scan_dir = _new_scan_dir(next_scan_num)
                     take_still(current_scan_dir, next_scan_num)
-
                 else:
-                    # create folder if one not already made
                     if not current_scan_dir:
                         current_scan_dir = _new_scan_dir(next_scan_num)
                         take_still(current_scan_dir, next_scan_num)
 
-                    # on even press, run sequence & reset directory
                     sequence(current_scan_dir, next_scan_num)
                     scan_counter += 1
                     current_scan_dir = None

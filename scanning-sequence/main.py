@@ -4,7 +4,7 @@ from picamera2 import Picamera2
 from datetime import date
 from PIL import Image, ImageDraw, ImageFont
 from luma.core.interface.serial import i2c
-from luma.lcd.device import st7567
+from luma.oled.device import ssd1306
 
 gpio.setmode(gpio.BCM)
 
@@ -29,7 +29,8 @@ cam.start()
 time.sleep(0.2)
 
 serial = i2c(port=1, address=0x3C)
-device = st7567(serial, width=128, height=64) # change THIS if controller is diff
+device = ssd1306(serial, width=128, height=64)
+device.contrast(255)
 
 WIDTH = device.width
 HEIGHT = device.height

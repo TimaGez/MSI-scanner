@@ -15,21 +15,17 @@ from luma.oled.device import ssd1306
 # GOAL: LED/capture <= 20s, processing can take longer
 # ============================================================
 MAX_SCAN_SECONDS = 20.0     # ONLY applies to capture (LED time)
-FRAMES_PER_BAND = 1         # MUST be 1 with your current 3s/frame behavior
+FRAMES_PER_BAND = 1         # with your current slow RAW capture, 1 is necessary
 
-# ROI crop for speed + consistency
 USE_CENTER_CROP = True
 CROP_SIZE = 700
 
-# Output
 SAVE_NPY_FLOAT16 = True
 SAVE_PREVIEW_PNG = True
 SAVE_16BIT_PNG = False
 
-# Small pedestal after dark subtraction (prevents all-zero output)
 PEDESTAL_RAW = 30.0
 
-# Settles (fast)
 CTRL_SETTLE = 0.04
 LED_SETTLE  = 0.06
 LED_OFF_GAP = 0.02
@@ -110,24 +106,56 @@ def apply_capture_settings(key: str) -> dict:
     }
 
 # ============================================================
-# OLED
+# OLED (FIXED: retry + boot splash + idle refresh)
 # ============================================================
-serial = i2c(port=1, address=0x3C)
-device = ssd1306(serial, width=128, height=64)
-device.contrast(255)
-
-WIDTH = device.width
-HEIGHT = device.height
 font = ImageFont.load_default()
 
+def init_oled_with_retry(max_tries: int = 12, delay_s: float = 0.35):
+    """
+    This is the missing piece vs your old code.
+    Boot can race I2C; retry makes it reliable.
+    """
+    last_err = None
+    for i in range(1, max_tries + 1):
+        try:
+            serial = i2c(port=1, address=0x3C)  # if your i2cdetect shows 0x3D, change this
+            dev = ssd1306(serial, width=128, height=64)
+            dev.contrast(255)
+
+            # boot splash
+            img = Image.new("1", (dev.width, dev.height))
+            draw = ImageDraw.Draw(img)
+            draw.text((0, 0),  "MSI Scanner", font=font, fill=255)
+            draw.text((0, 16), "Booting...", font=font, fill=255)
+            draw.text((0, 32), f"OLED try {i}", font=font, fill=255)
+            dev.display(img)
+
+            return dev
+
+        except Exception as e:
+            last_err = e
+            time.sleep(delay_s)
+
+    print(f"[OLED] failed init after {max_tries} tries: {last_err}")
+    return None
+
+device = init_oled_with_retry()
+WIDTH = device.width if device else 128
+HEIGHT = device.height if device else 64
+
 def oled_msg(line1: str, line2: str = "", line3: str = "", line4: str = ""):
-    image = Image.new("1", (WIDTH, HEIGHT))
-    draw = ImageDraw.Draw(image)
+    if device is None:
+        return
+    img = Image.new("1", (WIDTH, HEIGHT))
+    draw = ImageDraw.Draw(img)
     draw.text((0, 0),  line1[:21], font=font, fill=255)
     draw.text((0, 16), line2[:21], font=font, fill=255)
     draw.text((0, 32), line3[:21], font=font, fill=255)
     draw.text((0, 48), line4[:21], font=font, fill=255)
-    device.display(image)
+    device.display(img)
+
+# Immediately show READY on startup (this is also something the last code lacked)
+oled_msg("MSI Scanner", "READY", "Press button", "for still/scan")
 
 # ============================================================
 # SIGNAL SAFETY
@@ -139,7 +167,8 @@ def _handle_signal(signum, frame):
     except Exception:
         pass
     try:
-        device.display(Image.new("1", (WIDTH, HEIGHT)))
+        if device:
+            device.display(Image.new("1", (WIDTH, HEIGHT)))
     except Exception:
         pass
     try:
@@ -152,7 +181,7 @@ signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 # ============================================================
-# IO / IMAGE HELPERS
+# FILE / IMAGE HELPERS
 # ============================================================
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -221,18 +250,13 @@ def _deadline_ok(deadline_t: float):
         raise ScanTimeout("Scan exceeded MAX_SCAN_SECONDS")
 
 def _capture_n_intensity(n: int) -> (np.ndarray, list):
-    """
-    Capture n intensity frames (no LED control inside).
-    Returns average + list of capture durations.
-    """
     acc = None
     times = []
     for _ in range(n):
         t0 = time.monotonic()
         raw = cam.capture_array("raw")
         frame = _raw_to_intensity(raw)
-        dt = time.monotonic() - t0
-        times.append(dt)
+        times.append(time.monotonic() - t0)
         if acc is None:
             acc = frame
         else:
@@ -240,27 +264,20 @@ def _capture_n_intensity(n: int) -> (np.ndarray, list):
     return acc / float(n), times
 
 def scan_band_capture_only(key: str, led_pin: int, deadline_t: float):
-    """
-    CAPTURE-ONLY: returns (D, I, ctrl_meta, timing_meta)
-    Processing/saving happens later (unbounded).
-    """
     ctrl = apply_capture_settings(key)
     time.sleep(CTRL_SETTLE)
     _deadline_ok(deadline_t)
 
-    # DARK (LED off)
     gpio.output(led_pin, gpio.LOW)
     time.sleep(LED_OFF_GAP)
     _deadline_ok(deadline_t)
     D, d_times = _capture_n_intensity(FRAMES_PER_BAND)
 
-    # ON (LED on)
     gpio.output(led_pin, gpio.HIGH)
     time.sleep(LED_SETTLE)
     _deadline_ok(deadline_t)
     I, i_times = _capture_n_intensity(FRAMES_PER_BAND)
 
-    # Turn LED off immediately after last capture
     gpio.output(led_pin, gpio.LOW)
     time.sleep(LED_OFF_GAP)
 
@@ -278,20 +295,14 @@ def take_still(scan_dir: str, scan_num: int) -> None:
     cam.capture_file(os.path.join(scan_dir, f"{date.today()}-scan{scan_num:03d}-still.jpg"))
 
 def sequence(scan_dir: str, scan_num: int) -> None:
-    """
-    Stage 1 (bounded): capture D/I for each band quickly, LEDs on only during capture.
-    Stage 2 (unbounded): processing + saving (OLED says PROCESSING).
-    """
     base = os.path.join(scan_dir, f"{date.today()}-scan{scan_num:03d}")
     deadline_t = time.monotonic() + MAX_SCAN_SECONDS
 
     oled_msg("MSI Scanner", f"Scan {scan_num}", "CAPTURING...", "")
     t_scan0 = time.monotonic()
 
-    # -------- CAPTURE ONLY (bounded) --------
-    captured = {}  # key -> (D, I, ctrl, timing)
+    captured = {}
     try:
-        # order: 730, 450, 660
         oled_msg("MSI Scanner", f"Scan {scan_num}", "CAPTURE 730", "")
         captured["w730"] = scan_band_capture_only("w730", pins["w730"], deadline_t)
 
@@ -311,7 +322,7 @@ def sequence(scan_dir: str, scan_num: int) -> None:
 
     t_scan = time.monotonic() - t_scan0
 
-    # -------- PROCESS + SAVE (unbounded) --------
+    # processing unbounded
     oled_msg("MSI Scanner", f"Scan {scan_num}", "PROCESSING...", "")
     t_proc0 = time.monotonic()
 
@@ -335,25 +346,37 @@ def sequence(scan_dir: str, scan_num: int) -> None:
             "timestamp": datetime.now().isoformat(),
         }
         _save_outputs(out_base, X, meta)
-
         oled_msg("MSI Scanner", f"Scan {scan_num}", "PROCESSING...", nm)
 
     t_proc = time.monotonic() - t_proc0
-    oled_msg("MSI Scanner", f"Scan {scan_num}", "DONE", f"cap:{t_scan:.1f}s", f"proc:{t_proc:.1f}s")
+    oled_msg("MSI Scanner", f"Scan {scan_num}", "DONE",
+             f"cap:{t_scan:.1f}s", f"proc:{t_proc:.1f}s")
 
 # ============================================================
-# MAIN LOOP
+# MAIN LOOP (FIXED: idle refresh so OLED stays alive)
 # ============================================================
 last_state = gpio.input(button_pin)
 scan_counter = 0
 press_counter = 0
 current_scan_dir = None
+last_idle_draw = 0.0
 
 def main():
-    global last_state, scan_counter, press_counter, current_scan_dir
+    global last_state, scan_counter, press_counter, current_scan_dir, last_idle_draw
+
     try:
         while True:
             state = gpio.input(button_pin)
+
+            # idle refresh every ~0.5s so OLED doesn't stay blank if first draw missed
+            now = time.monotonic()
+            if now - last_idle_draw > 0.5:
+                next_phase = "STILL" if (press_counter % 2 == 0) else "SCAN"
+                oled_msg("MSI Scanner",
+                         f"Scan #: {scan_counter}",
+                         f"Next: {next_phase}",
+                         "Press button")
+                last_idle_draw = now
 
             if state == gpio.LOW and last_state == gpio.HIGH:
                 press_counter += 1
@@ -385,7 +408,11 @@ def main():
         pass
     finally:
         all_leds_off()
-        device.display(Image.new("1", (WIDTH, HEIGHT)))
+        try:
+            if device:
+                device.display(Image.new("1", (WIDTH, HEIGHT)))
+        except Exception:
+            pass
         try:
             cam.stop()
         except Exception:

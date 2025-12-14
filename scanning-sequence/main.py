@@ -1,3 +1,4 @@
+import numpy as np
 import os
 import RPi.GPIO as gpio
 import time
@@ -11,10 +12,8 @@ gpio.setmode(gpio.BCM)
 
 pins = {
     "n450": 17,
-    "j660": 27,
     "g730": 22,
     "k850": 23,
-    "h940": 24
 }
 
 button_pin = 26
@@ -25,37 +24,51 @@ for k in pins.values():
 gpio.setup(button_pin, gpio.IN, pull_up_down=gpio.PUD_UP)
 
 cam = Picamera2()
-cam.configure(cam.create_still_configuration())
+cam.configure(cam.create_still_configuration(
+    main={"format":"YUV420"}))
 cam.start()
 
-# --- camera stability ---
-time.sleep(1.0)  # let the pipeline settle
-cam.set_controls({"AeEnable": False, "AwbEnable": False})  # keep autos OFF always
-# -----------------------
+cam.set_controls({
+    "AfMode": 0,
+    "LensPosition": 4.5
+})
 
-# Per-capture exposure settings (tune these numbers if needed)
+time.sleep(1.0)
+cam.set_controls({
+    "AeEnable": False,
+    "AwbEnable": False,
+    "ColourGains": (1.0, 1.0),
+    "Saturation": 1.0,
+    "Sharpness": 0.0,
+    "NoiseReductionMode": 0
+})
+
 CAPTURE_SETTINGS = {
-    "still": {"ExposureTime": 2500, "AnalogueGain": 1.0},
+    "still": {"ExposureTime": 350, "AnalogueGain": 1.0, "LensPosition": 4.5},
 
-    # Visible: usually needs SHORT exposure to avoid blowing out
-    "450":  {"ExposureTime": 300,  "AnalogueGain": 1.0},
-    "660":  {"ExposureTime": 400,  "AnalogueGain": 1.0},
-
-    # NIR: usually needs longer exposure (NoIR response varies a lot)
-    "730":  {"ExposureTime": 2500, "AnalogueGain": 1.5},
-    "850":  {"ExposureTime": 6000, "AnalogueGain": 2.0},
-    "940":  {"ExposureTime": 12000, "AnalogueGain": 2.5},
+    "450":  {"ExposureTime": 5,  "AnalogueGain": 1, "LensPosition": 7.5},
+    "730":  {"ExposureTime": 200000, "AnalogueGain": 7.5, "LensPosition": 7.5},
+    "850":  {"ExposureTime": 10, "AnalogueGain": 0.5, "LensPosition": 7.5},
 }
 
 def apply_capture_settings(key: str) -> None:
     s = CAPTURE_SETTINGS[key]
-    cam.set_controls({
+
+    controls = {
         "AeEnable": False,
-        "AwbEnable": False,
         "ExposureTime": int(s["ExposureTime"]),
         "AnalogueGain": float(s["AnalogueGain"]),
-        "Saturation": 0.0,  # helps avoid “solid color wash” look; safe for analysis
-    })
+        "LensPosition": float(s["LensPosition"]),
+    }
+
+    if key == "still":
+        controls["AwbEnable"] = True
+        controls["Saturation"] = 1.0
+    else:
+        controls["AwbEnable"] = False
+        controls["Saturation"] = 0.0
+
+        cam.set_controls(controls)
 
 
 serial = i2c(port=1, address=0x3C)
@@ -73,9 +86,9 @@ scan_counter = 0
 press_counter = 0
 current_scan_dir = None
 
-LED_SETTLE = 0.25
-LED_OFF_GAP = 0.05
-CTRL_SETTLE = 0.05  # small delay after changing exposure controls
+LED_SETTLE = 0.5
+LED_OFF_GAP = 0.15
+CTRL_SETTLE = 0.15  # small delay after changing exposure controls
 
 
 def _ensure_dir(path: str) -> None:
@@ -101,17 +114,12 @@ def sequence(scan_dir: str, scan_num: int) -> None:
     time.sleep(LED_SETTLE)
     apply_capture_settings("450")
     time.sleep(CTRL_SETTLE)
-    cam.capture_file(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-450nm.jpg"))
+    frame = cam.capture_array("main")
+    h,w = frame.shape[0]*2//3, frame.shape[1]
+    Y = frame[:h, :]
+    img = Image.fromarray(Y, mode="L")
+    img.save(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-450nm.jpg"))
     gpio.output(pins["n450"], gpio.LOW)
-    time.sleep(LED_OFF_GAP)
-
-    # 660 nm
-    gpio.output(pins["j660"], gpio.HIGH)
-    time.sleep(LED_SETTLE)
-    apply_capture_settings("660")
-    time.sleep(CTRL_SETTLE)
-    cam.capture_file(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-660nm.jpg"))
-    gpio.output(pins["j660"], gpio.LOW)
     time.sleep(LED_OFF_GAP)
 
     # 730 nm
@@ -119,7 +127,11 @@ def sequence(scan_dir: str, scan_num: int) -> None:
     time.sleep(LED_SETTLE)
     apply_capture_settings("730")
     time.sleep(CTRL_SETTLE)
-    cam.capture_file(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-730nm.jpg"))
+    frame = cam.capture_array("main")
+    h,w = frame.shape[0]*2//3, frame.shape[1]
+    Y = frame[:h, :]
+    img = Image.fromarray(Y, mode="L")
+    img.save(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-730nm.jpg"))
     gpio.output(pins["g730"], gpio.LOW)
     time.sleep(LED_OFF_GAP)
 
@@ -128,17 +140,12 @@ def sequence(scan_dir: str, scan_num: int) -> None:
     time.sleep(LED_SETTLE)
     apply_capture_settings("850")
     time.sleep(CTRL_SETTLE)
-    cam.capture_file(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-850nm.jpg"))
+    frame = cam.capture_array("main")
+    h,w = frame.shape[0]*2//3, frame.shape[1]
+    Y = frame[:h, :]
+    img = Image.fromarray(Y, mode="L")
+    img.save(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-850nm.jpg"))
     gpio.output(pins["k850"], gpio.LOW)
-    time.sleep(LED_OFF_GAP)
-
-    # 940 nm
-    gpio.output(pins["h940"], gpio.HIGH)
-    time.sleep(LED_SETTLE)
-    apply_capture_settings("940")
-    time.sleep(CTRL_SETTLE)
-    cam.capture_file(os.path.join(scan_dir, f"{day}-scan{scan_num:03d}-940nm.jpg"))
-    gpio.output(pins["h940"], gpio.LOW)
     time.sleep(LED_OFF_GAP)
 
 

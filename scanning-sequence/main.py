@@ -435,7 +435,7 @@ def run_scan(session_dir: str, session_num: int):
         all_leds_off()
         with open(base + "-TIMEOUT.txt", "w") as f:
             f.write(f"Capture timed out after {MAX_CAPTURE_SECONDS} seconds\n")
-        oled_msg("MSI Scanner", f"Session {session_num}", "TIMEOUT", "", "")
+        oled_msg("MSI Scanner", f"Session {session_num}", "TIMEOUT", "")
         raise
     finally:
         all_leds_off()
@@ -489,7 +489,7 @@ def main():
                     oled_msg("MSI Scanner", f"Session {session_counter}", "STILL...", "")
                     take_still_unmodified(session_dir, session_counter)
                     oled_msg("MSI Scanner", f"Session {session_counter}", "STILL saved ✅",
-                             "Hold=CAL", "Press=SCAN")
+                             "Hold=CAL")
                     stage = "HAVE_STILL"
                     continue
 
@@ -501,7 +501,7 @@ def main():
                             capture_white_reference(session_dir, session_counter)
                             time.sleep(0.4)
                             oled_msg("MSI Scanner", f"Session {session_counter}",
-                                     "READY", "Press=SCAN", "Hold=CAL (redo)")
+                                     "READY", "Press=SCAN")
                         except Exception:
                             oled_msg("CALIBRATION", "FAILED", "", "")
                             time.sleep(0.8)

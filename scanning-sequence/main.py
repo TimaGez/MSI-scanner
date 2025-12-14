@@ -3,6 +3,7 @@ import time
 import json
 import signal
 import atexit
+import threading
 import numpy as np
 import RPi.GPIO as gpio
 
@@ -13,42 +14,28 @@ from luma.core.interface.serial import i2c
 from luma.oled.device import ssd1306
 
 # ============================================================
-# SPEED / RELIABILITY CONFIG
+# GUARANTEES / LIMITS
 # ============================================================
+MAX_SCAN_SECONDS = 25.0        # total sequence cap
+FRAMES_PER_BAND = 2            # keep 2; we’ll fix stalls properly
+CAPTURE_TIMEOUT_S = 1.2        # per raw frame capture timeout
+CAPTURE_RETRIES = 2            # retry a blocked capture a couple times
 
-# Hard cap. This code is faster, so it shouldn't hit it.
-# If you REALLY need max 20, set to 20.0 after you confirm it runs.
-MAX_SCAN_SECONDS = 25.0
-
-# Capture count per band:
-# 2 gives a nice noise reduction without costing time/RAM.
-FRAMES_PER_BAND = 2
-
-# Cropping makes everything faster + removes housing edges
 USE_CENTER_CROP = True
-CROP_SIZE = 700  # smaller = faster disk + faster processing (tune)
+CROP_SIZE = 700
 
-# Output strategy (fast):
-# - Save .npy in float16 (small + fast, still great for ML)
-# - Save preview PNG (8-bit stretched) for humans
 SAVE_NPY_FLOAT16 = True
 SAVE_PREVIEW_PNG = True
-
-# Optional "scientific" 16-bit PNG (often big + slow on SD card)
 SAVE_16BIT_PNG = False
 
-# Fast settles
 CTRL_SETTLE = 0.04
-LED_SETTLE  = 0.06
-LED_OFF_GAP = 0.02
-INTER_FRAME_GAP = 0.001
+LED_SETTLE  = 0.02             # small; we pulse per frame now
+LED_OFF_GAP = 0.01
+INTER_FRAME_GAP = 0.002
 
 RAW_BIT_DEPTH = 10
 RAW_MAX = (1 << RAW_BIT_DEPTH) - 1  # 1023
-
-# After dark subtraction, add a small pedestal to avoid "all zeros"
-# (helps stability + prevents flat previews)
-PEDESTAL_RAW = 30.0  # tune 0–80
+PEDESTAL_RAW = 30.0
 
 # ============================================================
 # GPIO
@@ -88,14 +75,11 @@ cam.configure(cam.create_still_configuration(
 cam.start()
 time.sleep(0.6)
 
-# Lock focus + disable auto + disable extra processing
 cam.set_controls({
     "AfMode": 0,
     "LensPosition": 7.5,
-
     "AeEnable": False,
     "AwbEnable": False,
-
     "Brightness": 0.0,
     "Contrast": 1.0,
     "Saturation": 0.0,
@@ -103,10 +87,8 @@ cam.set_controls({
     "NoiseReductionMode": 0,
 })
 
-# Per-band settings (you will tune these)
 CAPTURE_SETTINGS = {
     "still": {"ExposureTime": 3500,  "AnalogueGain": 1.0, "LensPosition": 7.5},
-
     "w730":  {"ExposureTime": 25000, "AnalogueGain": 2.0, "LensPosition": 7.5},
     "w450":  {"ExposureTime": 45000, "AnalogueGain": 4.0, "LensPosition": 7.5},
     "w660":  {"ExposureTime": 25000, "AnalogueGain": 2.0, "LensPosition": 7.5},
@@ -161,7 +143,7 @@ signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 # ============================================================
-# FILE / IMAGE HELPERS
+# HELPERS
 # ============================================================
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -191,7 +173,6 @@ def _split_rggb_planes(raw: np.ndarray):
     return R, G, B
 
 def _raw_to_intensity(raw: np.ndarray) -> np.ndarray:
-    # Stable intensity (avoid picking one plane)
     R, G, B = _split_rggb_planes(raw)
     I = (R + 2.0*G + B) * 0.25
     return _center_crop(I, CROP_SIZE)
@@ -201,7 +182,6 @@ def _to_u16(img: np.ndarray) -> np.ndarray:
     return (x * (65535.0 / RAW_MAX)).astype(np.uint16)
 
 def _save_preview_png(out_base: str, img_f32: np.ndarray):
-    # Percentile stretch for viewing (does NOT affect training array)
     lo, hi = np.percentile(img_f32, (2, 98))
     if hi <= lo:
         vis = np.zeros_like(img_f32, dtype=np.uint8)
@@ -211,26 +191,23 @@ def _save_preview_png(out_base: str, img_f32: np.ndarray):
     Image.fromarray(vis, mode="L").save(out_base + "-preview.png")
 
 def _save_outputs(out_base: str, img_f32: np.ndarray, meta: dict) -> None:
-    # Fast ML tensor
     if SAVE_NPY_FLOAT16:
         np.save(out_base + ".npy", img_f32.astype(np.float16))
-
-    # Optional 16-bit png (slow)
     if SAVE_16BIT_PNG:
         u16 = _to_u16(img_f32)
         Image.fromarray(u16, mode="I;16").save(out_base + ".png")
-
-    # Preview for humans
     if SAVE_PREVIEW_PNG:
         _save_preview_png(out_base, img_f32)
-
     with open(out_base + ".json", "w") as f:
         json.dump(meta, f, indent=2)
 
 # ============================================================
-# TIMEOUT / DEADLINE
+# TIMEOUTS
 # ============================================================
 class ScanTimeout(Exception):
+    pass
+
+class FrameTimeout(Exception):
     pass
 
 def _check_deadline(deadline_t: float):
@@ -238,56 +215,119 @@ def _check_deadline(deadline_t: float):
         raise ScanTimeout("Scan exceeded MAX_SCAN_SECONDS")
 
 # ============================================================
-# CAPTURE CORE (FAST + LED OFF BEFORE SAVING)
+# SAFE FRAME CAPTURE (prevents hanging forever)
 # ============================================================
-def _avg_stack(n: int, deadline_t: float) -> np.ndarray:
+def _capture_raw_with_timeout(timeout_s: float) -> np.ndarray:
+    result = {}
+    exc = {}
+
+    def worker():
+        try:
+            result["raw"] = cam.capture_array("raw")
+        except Exception as e:
+            exc["e"] = e
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout_s)
+
+    if t.is_alive():
+        raise FrameTimeout(f"cam.capture_array('raw') exceeded {timeout_s}s")
+
+    if "e" in exc:
+        raise exc["e"]
+
+    return result["raw"]
+
+def _capture_intensity_frame(deadline_t: float) -> np.ndarray:
+    _check_deadline(deadline_t)
+    raw = _capture_raw_with_timeout(CAPTURE_TIMEOUT_S)
+    return _raw_to_intensity(raw).astype(np.float32)
+
+# ============================================================
+# CAPTURE CORE (LED PULSED PER FRAME)
+# ============================================================
+def _avg_stack_pulsed(n: int, led_pin: int, led_on: bool, deadline_t: float) -> (np.ndarray, list):
+    """
+    Captures n frames. If led_on=True, LED is pulsed for each frame capture
+    to prevent it staying on during any unexpected stall.
+    Returns average + list of per-frame capture durations.
+    """
     acc = None
+    durations = []
+
     for _ in range(n):
         _check_deadline(deadline_t)
-        raw = cam.capture_array("raw")
-        frame = _raw_to_intensity(raw)  # float32
+
+        if led_on:
+            gpio.output(led_pin, gpio.HIGH)
+            time.sleep(LED_SETTLE)
+        else:
+            gpio.output(led_pin, gpio.LOW)
+            time.sleep(LED_OFF_GAP)
+
+        t0 = time.monotonic()
+        frame = None
+
+        # retry if capture blocks
+        for attempt in range(CAPTURE_RETRIES + 1):
+            try:
+                frame = _capture_intensity_frame(deadline_t)
+                break
+            except FrameTimeout:
+                # turn LED off immediately and retry
+                gpio.output(led_pin, gpio.LOW)
+                time.sleep(LED_OFF_GAP)
+                if attempt == CAPTURE_RETRIES:
+                    raise
+                time.sleep(0.02)
+
+        # LED off immediately after frame
+        gpio.output(led_pin, gpio.LOW)
+        time.sleep(LED_OFF_GAP)
+
+        dt = time.monotonic() - t0
+        durations.append(dt)
+
         if acc is None:
             acc = frame
         else:
             acc += frame
-        time.sleep(INTER_FRAME_GAP)
-    return acc / float(n)
 
-def capture_band_fast(key: str, out_base: str, led_pin: int, deadline_t: float) -> None:
+        time.sleep(INTER_FRAME_GAP)
+
+    return acc / float(n), durations
+
+def capture_band(key: str, out_base: str, led_pin: int, deadline_t: float) -> None:
     ctrl = apply_capture_settings(key)
     time.sleep(CTRL_SETTLE)
     _check_deadline(deadline_t)
 
-    # Make absolutely sure LED is off before starting dark frames
-    gpio.output(led_pin, gpio.LOW)
-    time.sleep(LED_OFF_GAP)
+    # DARK average (LED OFF, pulsed off anyway)
+    D, d_times = _avg_stack_pulsed(FRAMES_PER_BAND, led_pin, led_on=False, deadline_t=deadline_t)
 
-    # DARK frames (LED OFF)
-    D = _avg_stack(FRAMES_PER_BAND, deadline_t)
+    # ON average (LED pulsed per frame)
+    I, i_times = _avg_stack_pulsed(FRAMES_PER_BAND, led_pin, led_on=True, deadline_t=deadline_t)
 
-    # ON frames (LED ON)
-    gpio.output(led_pin, gpio.HIGH)
-    time.sleep(LED_SETTLE)
-
-    I = _avg_stack(FRAMES_PER_BAND, deadline_t)
-
-    # IMPORTANT FIX:
-    # Turn LED OFF IMMEDIATELY after captures, BEFORE processing/saving.
-    gpio.output(led_pin, gpio.LOW)
-    time.sleep(LED_OFF_GAP)
-
-    # Now do math + saving with LED safely off
     X = (I - D) + PEDESTAL_RAW
     X = np.clip(X, 0, RAW_MAX)
 
     meta = {
         "band": key,
         "frames_per_band": FRAMES_PER_BAND,
+        "capture_timeout_s": CAPTURE_TIMEOUT_S,
+        "capture_retries": CAPTURE_RETRIES,
         "dark_subtraction": True,
         "pedestal_raw": PEDESTAL_RAW,
         "crop": {"enabled": USE_CENTER_CROP, "size": CROP_SIZE},
         "camera_controls": ctrl,
         "raw_bit_depth": RAW_BIT_DEPTH,
+        "timings": {
+            "dark_frame_seconds": d_times,
+            "on_frame_seconds": i_times,
+            "dark_total_s": float(sum(d_times)),
+            "on_total_s": float(sum(i_times)),
+        },
         "timestamp": datetime.now().isoformat(),
     }
     _save_outputs(out_base, X, meta)
@@ -302,15 +342,18 @@ def sequence(scan_dir: str, scan_num: int) -> None:
     base = os.path.join(scan_dir, f"{date.today()}-scan{scan_num:03d}")
 
     try:
-        capture_band_fast("w730", base + "-730nm", pins["w730"], deadline_t)
-        capture_band_fast("w450", base + "-450nm", pins["w450"], deadline_t)
-        capture_band_fast("w660", base + "-660nm", pins["w660"], deadline_t)
-
+        capture_band("w730", base + "-730nm", pins["w730"], deadline_t)
+        capture_band("w450", base + "-450nm", pins["w450"], deadline_t)
+        capture_band("w660", base + "-660nm", pins["w660"], deadline_t)
     except ScanTimeout:
-        # Force all LEDs off and log timeout
         all_leds_off()
         with open(base + "-TIMEOUT.txt", "w") as f:
             f.write(f"Timed out after {MAX_SCAN_SECONDS} seconds\n")
+        raise
+    except FrameTimeout as e:
+        all_leds_off()
+        with open(base + "-FRAME_TIMEOUT.txt", "w") as f:
+            f.write(str(e) + "\n")
         raise
 
 # ============================================================
@@ -324,12 +367,10 @@ current_scan_dir = None
 def oled_status(state: int, scan_counter: int, press_counter: int, msg: str = ""):
     image = Image.new("1", (WIDTH, HEIGHT))
     draw = ImageDraw.Draw(image)
-
     draw.text((0, 0), "MSI Scanner", font=font, fill=255)
     draw.text((0, 16), f"Scan #: {scan_counter}", font=font, fill=255)
     next_phase = "STILL" if (press_counter % 2 == 0) else "SCAN"
     draw.text((0, 32), f"Next: {next_phase}", font=font, fill=255)
-
     btn_txt = "PRESSED" if state == gpio.LOW else "released"
     draw.text((0, 48), (btn_txt + " " + msg)[:21], font=font, fill=255)
     device.display(image)
@@ -341,20 +382,16 @@ def main():
         while True:
             state = gpio.input(button_pin)
 
-            # press edge: HIGH -> LOW
             if state == gpio.LOW and last_state == gpio.HIGH:
                 press_counter += 1
                 next_scan_num = scan_counter + 1
 
                 if press_counter % 2 == 1:
-                    # Press 1: make folder + still
                     current_scan_dir = _new_scan_dir(next_scan_num)
                     oled_status(state, scan_counter, press_counter, "STILL")
                     take_still(current_scan_dir, next_scan_num)
                     oled_status(state, scan_counter, press_counter, "READY")
-
                 else:
-                    # Press 2: scan
                     if not current_scan_dir:
                         current_scan_dir = _new_scan_dir(next_scan_num)
                         take_still(current_scan_dir, next_scan_num)
@@ -364,8 +401,8 @@ def main():
                         sequence(current_scan_dir, next_scan_num)
                         scan_counter += 1
                         oled_status(state, scan_counter, press_counter, "DONE")
-                    except ScanTimeout:
-                        oled_status(state, scan_counter, press_counter, "TIMEOUT")
+                    except Exception:
+                        oled_status(state, scan_counter, press_counter, "ERR")
                     finally:
                         current_scan_dir = None
                         all_leds_off()

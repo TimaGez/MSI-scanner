@@ -14,34 +14,46 @@ from luma.core.interface.serial import i2c
 from luma.oled.device import ssd1306
 
 # ============================================================
-# BEHAVIOR
+# WORKFLOW (HARD CODED)
 #   Press #1 -> STILL (unchanged JPG)
-#   Press #2 -> CAL then SCAN (back-to-back, don't move)
+#   Press #2 -> CAL then SCAN (back-to-back, do not move)
+#
+# Bands used:
+#   ✅ 730nm, 660nm
+#   🚫 450nm removed (commented out everywhere)
 # ============================================================
 
-MAX_CAPTURE_SECONDS = 20.0  # CAPTURE budget only (processing can take longer)
+MAX_CAPTURE_SECONDS = 20.0  # capture budget only
 
-# Hard-coded frames (kept tiny to guarantee no timeout)
-CAL_ON_FRAMES  = {"w730": 1, "w450": 1, "w660": 1}
-SCAN_ON_FRAMES = {"w730": 1, "w450": 1, "w660": 1}  # bump w450 to 2 only if you have time
+# Frames per band (averaging reduces noise)
+CAL_ON_FRAMES  = {"w730": 3, "w660": 3}
+SCAN_ON_FRAMES = {"w730": 3, "w660": 3}
 
-# One global DARK capture reused across CAL+SCAN (major speedup)
-DARK_FRAMES_GLOBAL = 1
+# One global dark frame reused across CAL+SCAN
+DARK_FRAMES_GLOBAL = 2
 
-# Crop to remove housing + reduce compute
+# Crop size (center)
 USE_CENTER_CROP = True
 CROP_SIZE = 700
+
+# Mask out housing/ring (keep center disk)
+USE_CIRCULAR_MASK = True
+CIRCULAR_MASK_FRAC = 0.47  # radius = frac * min(H,W); tune 0.40-0.48
 
 # Output
 SAVE_FLOAT16 = True
 SAVE_PREVIEW_PNG = True
 SAVE_PER_BAND_CORR = True
-SAVE_ML_RATIOS = True
+SAVE_ML_TENSOR = True  # we’ll save 3ch tensor: [660_corr, 730_corr, 660/730]
+
+# Preview only (do not clip ML arrays)
+PREVIEW_CLIP_PCT = (2, 98)
 
 # Math stabilization
 EPS = 1e-6
 PEDESTAL_RAW = 20.0
-CLIP_PCT = (1, 99)
+RAW_BIT_DEPTH = 10
+RAW_MAX = (1 << RAW_BIT_DEPTH) - 1
 
 # Timing
 CTRL_SETTLE = 0.03
@@ -49,24 +61,17 @@ LED_SETTLE  = 0.06
 LED_OFF_GAP = 0.01
 INTER_FRAME_GAP = 0.001
 
-RAW_BIT_DEPTH = 10
-RAW_MAX = (1 << RAW_BIT_DEPTH) - 1  # 1023
-
 # Button debounce / guard
 DEBOUNCE_STABLE_S = 0.06
 POST_PRESS_GUARD_S = 0.45
-
-# Optional: stop double-presses from being counted as two presses
 MIN_SECONDS_BETWEEN_PRESSES = 1.2
 
-# ============================================================
-# GPIO
-# ============================================================
+# ---------------- GPIO ----------------
 gpio.setmode(gpio.BCM)
 
 pins = {
     "w730": 22,
-    "w450": 17,
+    # "w450": 17,  # 🚫 removed
     "w660": 23,
 }
 button_pin = 26
@@ -86,9 +91,7 @@ def all_leds_off():
 
 atexit.register(all_leds_off)
 
-# ============================================================
-# CAMERA
-# ============================================================
+# ---------------- Camera ----------------
 cam = Picamera2()
 cam.configure(cam.create_still_configuration(
     main={"format": "YUV420"},
@@ -97,6 +100,7 @@ cam.configure(cam.create_still_configuration(
 cam.start()
 time.sleep(0.6)
 
+# Lock focus + disable auto
 cam.set_controls({
     "AfMode": 0,
     "LensPosition": 7.5,
@@ -109,13 +113,11 @@ cam.set_controls({
     "NoiseReductionMode": 0,
 })
 
+# Lower gain, rely on averaging
 CAPTURE_SETTINGS = {
     "still": {"ExposureTime": 3500,  "AnalogueGain": 1.0, "LensPosition": 7.5},
-
-    # Tune later; these values won't affect capture-call overhead much
-    "w730":  {"ExposureTime": 25000, "AnalogueGain": 2.0, "LensPosition": 7.5},
-    "w450":  {"ExposureTime": 45000, "AnalogueGain": 4.0, "LensPosition": 7.5},
-    "w660":  {"ExposureTime": 25000, "AnalogueGain": 2.0, "LensPosition": 7.5},
+    "w730":  {"ExposureTime": 20000, "AnalogueGain": 1.5, "LensPosition": 7.5},
+    "w660":  {"ExposureTime": 20000, "AnalogueGain": 1.5, "LensPosition": 7.5},
 }
 
 def apply_capture_settings(key: str) -> dict:
@@ -133,16 +135,14 @@ def apply_capture_settings(key: str) -> dict:
         "LensPosition": float(s["LensPosition"]),
     }
 
-# ============================================================
-# OLED (boot-reliable)
-# ============================================================
+# ---------------- OLED (boot-reliable) ----------------
 font = ImageFont.load_default()
 
 def init_oled_with_retry(max_tries: int = 12, delay_s: float = 0.35):
     last_err = None
     for i in range(1, max_tries + 1):
         try:
-            serial = i2c(port=1, address=0x3C)  # if yours is 0x3D, change here
+            serial = i2c(port=1, address=0x3C)  # change to 0x3D if needed
             dev = ssd1306(serial, width=128, height=64)
             dev.contrast(255)
             img = Image.new("1", (dev.width, dev.height))
@@ -163,6 +163,7 @@ WIDTH = device.width if device else 128
 HEIGHT = device.height if device else 64
 
 def oled_msg(a="", b="", c="", d=""):
+    # ALWAYS 4 args max; keep it simple
     if device is None:
         return
     img = Image.new("1", (WIDTH, HEIGHT))
@@ -173,9 +174,7 @@ def oled_msg(a="", b="", c="", d=""):
     draw.text((0, 48), d[:21], font=font, fill=255)
     device.display(img)
 
-# ============================================================
-# SIGNAL SAFETY
-# ============================================================
+# ---------------- Signal safety ----------------
 def _handle_signal(signum, frame):
     all_leds_off()
     try:
@@ -196,9 +195,7 @@ def _handle_signal(signum, frame):
 signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
-# ============================================================
-# FILE / IMAGE HELPERS
-# ============================================================
+# ---------------- File helpers ----------------
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -212,7 +209,7 @@ def _save_npy(path: str, arr: np.ndarray):
     np.save(path, arr.astype(np.float16) if SAVE_FLOAT16 else arr.astype(np.float32))
 
 def _save_preview_png(path: str, img_f32: np.ndarray):
-    lo, hi = np.percentile(img_f32, (2, 98))
+    lo, hi = np.percentile(img_f32, PREVIEW_CLIP_PCT)
     if hi <= lo:
         vis = np.zeros_like(img_f32, dtype=np.uint8)
     else:
@@ -229,6 +226,13 @@ def _center_crop(img: np.ndarray, size: int) -> np.ndarray:
     x0 = (w - size) // 2
     return img[y0:y0+size, x0:x0+size]
 
+def _make_circular_mask(h: int, w: int, frac: float) -> np.ndarray:
+    yy, xx = np.ogrid[:h, :w]
+    cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
+    r = frac * min(h, w)
+    mask = ((yy - cy)**2 + (xx - cx)**2) <= (r**2)
+    return mask.astype(np.float32)
+
 def _split_rggb_planes(raw: np.ndarray):
     raw = raw.astype(np.float32)
     R  = raw[0::2, 0::2]
@@ -241,17 +245,13 @@ def _split_rggb_planes(raw: np.ndarray):
 def _raw_to_intensity(raw: np.ndarray) -> np.ndarray:
     R, G, B = _split_rggb_planes(raw)
     I = (R + 2.0*G + B) * 0.25
-    return _center_crop(I, CROP_SIZE).astype(np.float32)
+    I = _center_crop(I, CROP_SIZE).astype(np.float32)
+    if USE_CIRCULAR_MASK:
+        m = _make_circular_mask(I.shape[0], I.shape[1], CIRCULAR_MASK_FRAC)
+        I = I * m
+    return I
 
-def _clip_percentile(x: np.ndarray, pct=(1, 99)) -> np.ndarray:
-    lo, hi = np.percentile(x, pct)
-    if hi <= lo:
-        return np.zeros_like(x, dtype=np.float32)
-    return np.clip(x, lo, hi).astype(np.float32)
-
-# ============================================================
-# BUTTON (debounced press event)
-# ============================================================
+# ---------------- Button ----------------
 _last_press_time = 0.0
 
 def wait_for_debounced_press():
@@ -277,15 +277,11 @@ def wait_for_debounced_press():
 
         now = time.monotonic()
         if now - _last_press_time < MIN_SECONDS_BETWEEN_PRESSES:
-            # ignore accidental double-presses
             continue
-
         _last_press_time = now
         return
 
-# ============================================================
-# CAPTURE CORE (fast request-based raw grab)
-# ============================================================
+# ---------------- Capture core ----------------
 class CaptureTimeout(Exception):
     pass
 
@@ -294,9 +290,6 @@ def _deadline_ok(deadline_t: float):
         raise CaptureTimeout("Capture exceeded MAX_CAPTURE_SECONDS")
 
 def _capture_raw_array_fast() -> np.ndarray:
-    """
-    Often faster/cleaner than capture_array("raw") and ensures request is released.
-    """
     req = cam.capture_request()
     try:
         raw = req.make_array("raw")
@@ -331,24 +324,20 @@ def capture_band_on(band: str, led_pin: int, frames: int, deadline_t: float):
     gpio.output(led_pin, gpio.HIGH)
     time.sleep(LED_SETTLE)
     I, times = _capture_avg_intensity(frames, deadline_t)
+
     gpio.output(led_pin, gpio.LOW)
     time.sleep(LED_OFF_GAP)
-
     return I, ctrl, times
 
-# ============================================================
-# STILL (UNCHANGED)
-# ============================================================
+# ---------------- STILL (UNCHANGED) ----------------
 def take_still_unmodified(session_dir: str, session_num: int) -> str:
     apply_capture_settings("still")
     time.sleep(CTRL_SETTLE)
     path = os.path.join(session_dir, f"{date.today()}-session{session_num:03d}-still.jpg")
-    cam.capture_file(path)  # untouched
+    cam.capture_file(path)  # do not touch
     return path
 
-# ============================================================
-# CAL + SCAN (global dark frame -> big speedup)
-# ============================================================
+# ---------------- CAL + SCAN ----------------
 def do_cal_and_scan(session_dir: str, session_num: int):
     base = os.path.join(session_dir, f"{date.today()}-session{session_num:03d}")
     deadline_t = time.monotonic() + MAX_CAPTURE_SECONDS
@@ -356,31 +345,32 @@ def do_cal_and_scan(session_dir: str, session_num: int):
     meta = {
         "session_num": session_num,
         "timestamp": datetime.now().isoformat(),
+        "bands_used": ["730nm", "660nm"],
         "crop": {"enabled": USE_CENTER_CROP, "size": CROP_SIZE},
+        "circular_mask": {"enabled": USE_CIRCULAR_MASK, "frac": CIRCULAR_MASK_FRAC},
         "cal_on_frames": CAL_ON_FRAMES,
         "scan_on_frames": SCAN_ON_FRAMES,
         "dark_frames_global": DARK_FRAMES_GLOBAL,
         "pedestal_raw": PEDESTAL_RAW,
-        "clip_percentiles": CLIP_PCT,
+        "preview_clip_pct": PREVIEW_CLIP_PCT,
         "bands": {},
     }
 
-    # ---------- DARK once ----------
-    oled_msg("CAL+SCAN", "DO NOT MOVE", "DARK frame...", "")
+    # DARK once
+    oled_msg("CAL+SCAN", "DO NOT MOVE", "DARK capture", "")
     D, dark_times = capture_global_dark(deadline_t)
     meta["dark_frame_seconds"] = dark_times
 
-    # ---------- CAL ----------
-    oled_msg("CAL", "Capturing...", "730/450/660", "")
+    # CAL flats
     flats = {}
 
-    for band, nm in [("w730","730"), ("w450","450"), ("w660","660")]:
+    for band, nm in [("w730", "730"), ("w660", "660")]:
         oled_msg("CAL", f"ON {nm}nm", "capturing...", "")
         I, ctrl, on_times = capture_band_on(band, pins[band], CAL_ON_FRAMES[band], deadline_t)
 
         W = (I - D) + PEDESTAL_RAW
         W = np.clip(W, 0, RAW_MAX).astype(np.float32)
-        W = _clip_percentile(W, CLIP_PCT)
+
         flats[band] = W
 
         meta["bands"][band] = {
@@ -394,62 +384,56 @@ def do_cal_and_scan(session_dir: str, session_num: int):
         if SAVE_PREVIEW_PNG:
             _save_preview_png(out + "-preview.png", W)
 
-    # ---------- SCAN ----------
-    oled_msg("SCAN", "DO NOT MOVE", "Capturing...", "")
+    # SCAN corrected
     corr = {}
-
-    for band, nm in [("w730","730"), ("w450","450"), ("w660","660")]:
+    for band, nm in [("w730", "730"), ("w660", "660")]:
         oled_msg("SCAN", f"ON {nm}nm", "capturing...", "")
         I, ctrl, on_times = capture_band_on(band, pins[band], SCAN_ON_FRAMES[band], deadline_t)
 
         X = (I - D) + PEDESTAL_RAW
         X = np.clip(X, 0, RAW_MAX).astype(np.float32)
 
-        # Flat-field normalize with session-local flat
-        X = X / (flats[band] + EPS)
-        X = _clip_percentile(X, CLIP_PCT)
-        corr[band] = X
+        # flat-field correction (UNCLIPPED for ML)
+        Xcorr = X / (flats[band] + EPS)
+        corr[band] = Xcorr
 
         meta["bands"][band]["scan_on_frame_seconds"] = on_times
 
         if SAVE_PER_BAND_CORR:
             out = f"{base}-{nm}nm-corr"
-            _save_npy(out + ".npy", X)
+            _save_npy(out + ".npy", Xcorr)
             if SAVE_PREVIEW_PNG:
-                _save_preview_png(out + "-preview.png", X)
+                _save_preview_png(out + "-preview.png", Xcorr)
 
-    if SAVE_ML_RATIOS:
-        r_660_730 = _clip_percentile(corr["w660"] / (corr["w730"] + EPS), CLIP_PCT)
-        r_450_660 = _clip_percentile(corr["w450"] / (corr["w660"] + EPS), CLIP_PCT)
-        r_450_730 = _clip_percentile(corr["w450"] / (corr["w730"] + EPS), CLIP_PCT)
+    # ML tensor: [660_corr, 730_corr, ratio 660/730]
+    if SAVE_ML_TENSOR:
+        ratio = corr["w660"] / (corr["w730"] + EPS)
+        tensor = np.stack([corr["w660"], corr["w730"], ratio], axis=-1).astype(np.float32)
 
-        tensor = np.stack([r_660_730, r_450_660, r_450_730], axis=-1).astype(np.float32)
-        out_ml = f"{base}-ML-ratios"
+        out_ml = f"{base}-ML-tensor"
         _save_npy(out_ml + ".npy", tensor)
 
         if SAVE_PREVIEW_PNG:
-            _save_preview_png(out_ml + "-ch0-660over730.png", tensor[..., 0])
-            _save_preview_png(out_ml + "-ch1-450over660.png", tensor[..., 1])
-            _save_preview_png(out_ml + "-ch2-450over730.png", tensor[..., 2])
+            _save_preview_png(out_ml + "-ch0-660.png", tensor[..., 0])
+            _save_preview_png(out_ml + "-ch1-730.png", tensor[..., 1])
+            _save_preview_png(out_ml + "-ch2-660over730.png", tensor[..., 2])
 
         meta["ml_tensor"] = {
             "file": os.path.basename(out_ml + ".npy"),
-            "channels": ["660/730", "450/660", "450/730"],
+            "channels": ["660_corr", "730_corr", "660/730"],
         }
 
     with open(base + "-meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
+# ---------------- Main loop ----------------
 def main():
     session_counter = 0
-    stage = "WAIT_STILL"   # WAIT_STILL -> WAIT_CALSCAN
+    stage = "WAIT_STILL"
     session_dir = None
     session_num = None
 
-    oled_msg("MSI Scanner", "READY", "Press: STILL", "", "")
+    oled_msg("MSI Scanner", "READY", "Press: STILL", "")
 
     try:
         while True:
@@ -460,13 +444,10 @@ def main():
                 session_num = session_counter
                 session_dir = _new_session_dir(session_num)
 
-                oled_msg("MSI Scanner", f"Session {session_num}", "Taking STILL...", "")
+                oled_msg("MSI Scanner", f"Session {session_num}", "Taking STILL", "")
                 take_still_unmodified(session_dir, session_num)
 
-                oled_msg("MSI Scanner",
-                         f"Session {session_num}",
-                         "STILL saved ✅",
-                         "Press: CAL+SCAN")
+                oled_msg("MSI Scanner", f"Session {session_num}", "STILL saved", "Press: CAL+SCAN")
                 stage = "WAIT_CALSCAN"
 
             else:
@@ -475,12 +456,12 @@ def main():
 
                 try:
                     do_cal_and_scan(session_dir, session_num)
-                    oled_msg("DONE ✅", f"Session {session_num}", "Saved", "")
+                    oled_msg("DONE", f"Session {session_num}", "Saved", "")
                 except CaptureTimeout:
                     all_leds_off()
                     with open(base + "-TIMEOUT.txt", "w") as f:
                         f.write(f"Capture timed out after {MAX_CAPTURE_SECONDS} seconds\n")
-                    oled_msg("TIMEOUT", f"{MAX_CAPTURE_SECONDS:.0f}s cap", "reduce frames", "")
+                    oled_msg("TIMEOUT", f"{MAX_CAPTURE_SECONDS:.0f}s cap", "Lower frames", "")
                 except Exception:
                     all_leds_off()
                     err_path = base + "-ERROR.txt"
@@ -490,7 +471,7 @@ def main():
                 finally:
                     all_leds_off()
 
-                # reset for next session
+                # reset
                 stage = "WAIT_STILL"
                 session_dir = None
                 session_num = None

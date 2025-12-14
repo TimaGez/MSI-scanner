@@ -13,38 +13,45 @@ from luma.core.interface.serial import i2c
 from luma.oled.device import ssd1306
 
 # ============================================================
-# CONFIG
+# BEHAVIOR
+#   Press #1 -> STILL (unchanged JPG)
+#   Press #2 -> CAL then SCAN (back-to-back, don't move)
 # ============================================================
-MAX_CAPTURE_SECONDS = 20.0     # cap ONLY capture/LED time
-LONG_PRESS_S = 1.2
 
-FRAMES_PER_BAND = {
-    "w730": 1,
-    "w660": 1,
-    "w450": 2,   # blue needs more averaging
-}
+# Capture-only cap (LED/capture). Processing can take longer.
+MAX_CAPTURE_SECONDS = 20.0
 
+# Calibration should be fast; scanning needs more blue averaging
+CAL_FRAMES_PER_BAND  = {"w730": 1, "w450": 1, "w660": 1}
+SCAN_FRAMES_PER_BAND = {"w730": 1, "w450": 2, "w660": 1}
+
+# Crop for speed and to remove housing edge
 USE_CENTER_CROP = True
 CROP_SIZE = 700
 
-SAVE_PER_BAND_CORRECTED = True
-SAVE_PREVIEW_PNG = True
-SAVE_ML_TENSOR = True
+# Output
 SAVE_FLOAT16 = True
+SAVE_PREVIEW_PNG = True
+SAVE_PER_BAND_CORR = True
+SAVE_ML_RATIOS = True
 
-CAL_DIR = "calibration"
+# Math stabilization
 EPS = 1e-6
-
 PEDESTAL_RAW = 20.0
 CLIP_PCT = (1, 99)
 
+# Timing
 CTRL_SETTLE = 0.04
 LED_SETTLE  = 0.08
 LED_OFF_GAP = 0.02
 INTER_FRAME_GAP = 0.002
 
 RAW_BIT_DEPTH = 10
-RAW_MAX = (1 << RAW_BIT_DEPTH) - 1  # 1023
+RAW_MAX = (1 << RAW_BIT_DEPTH) - 1
+
+# Button debounce / guard
+DEBOUNCE_STABLE_S = 0.06
+POST_PRESS_GUARD_S = 0.40
 
 # ============================================================
 # GPIO
@@ -119,7 +126,7 @@ def apply_capture_settings(key: str) -> dict:
     }
 
 # ============================================================
-# OLED
+# OLED (boot-reliable)
 # ============================================================
 font = ImageFont.load_default()
 
@@ -127,13 +134,12 @@ def init_oled_with_retry(max_tries: int = 12, delay_s: float = 0.35):
     last_err = None
     for i in range(1, max_tries + 1):
         try:
-            serial = i2c(port=1, address=0x3C)
+            serial = i2c(port=1, address=0x3C)  # change to 0x3D if your OLED is 0x3D
             dev = ssd1306(serial, width=128, height=64)
             dev.contrast(255)
-
             img = Image.new("1", (dev.width, dev.height))
             draw = ImageDraw.Draw(img)
-            draw.text((0, 0),  "MSI Scanner", font=font, fill=255)
+            draw.text((0, 0), "MSI Scanner", font=font, fill=255)
             draw.text((0, 16), "Booting...", font=font, fill=255)
             draw.text((0, 32), f"OLED try {i}", font=font, fill=255)
             dev.display(img)
@@ -141,7 +147,6 @@ def init_oled_with_retry(max_tries: int = 12, delay_s: float = 0.35):
         except Exception as e:
             last_err = e
             time.sleep(delay_s)
-
     print(f"[OLED] init failed: {last_err}")
     return None
 
@@ -184,7 +189,7 @@ signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 # ============================================================
-# FILE HELPERS
+# FILE / IMAGE HELPERS
 # ============================================================
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -195,16 +200,18 @@ def _new_session_dir(session_num: int) -> str:
     _ensure_dir(folder)
     return folder
 
-def _cal_path(band: str) -> str:
-    _ensure_dir(CAL_DIR)
-    return os.path.join(CAL_DIR, f"flat_{band}.npy")
+def _save_npy(path: str, arr: np.ndarray):
+    np.save(path, arr.astype(np.float16) if SAVE_FLOAT16 else arr.astype(np.float32))
 
-def have_calibration() -> bool:
-    return all(os.path.exists(_cal_path(b)) for b in ["w730", "w450", "w660"])
+def _save_preview_png(path: str, img_f32: np.ndarray):
+    lo, hi = np.percentile(img_f32, (2, 98))
+    if hi <= lo:
+        vis = np.zeros_like(img_f32, dtype=np.uint8)
+    else:
+        vis = np.clip((img_f32 - lo) / (hi - lo), 0, 1)
+        vis = (vis * 255).astype(np.uint8)
+    Image.fromarray(vis, mode="L").save(path)
 
-# ============================================================
-# IMAGE HELPERS
-# ============================================================
 def _center_crop(img: np.ndarray, size: int) -> np.ndarray:
     if not USE_CENTER_CROP:
         return img
@@ -234,17 +241,35 @@ def _clip_percentile(x: np.ndarray, pct=(1, 99)) -> np.ndarray:
         return np.zeros_like(x, dtype=np.float32)
     return np.clip(x, lo, hi).astype(np.float32)
 
-def _save_preview_png(path: str, img_f32: np.ndarray):
-    lo, hi = np.percentile(img_f32, (2, 98))
-    if hi <= lo:
-        vis = np.zeros_like(img_f32, dtype=np.uint8)
-    else:
-        vis = np.clip((img_f32 - lo) / (hi - lo), 0, 1)
-        vis = (vis * 255).astype(np.uint8)
-    Image.fromarray(vis, mode="L").save(path)
+# ============================================================
+# BUTTON (debounced press event)
+# ============================================================
+def wait_for_debounced_press():
+    """
+    Blocks until a clean press is detected:
+      - requires stable LOW for DEBOUNCE_STABLE_S
+      - then waits for release
+      - then guard delay to prevent bounce re-trigger
+    """
+    while True:
+        while gpio.input(button_pin) == gpio.HIGH:
+            time.sleep(0.005)
 
-def _save_npy(path: str, arr: np.ndarray):
-    np.save(path, arr.astype(np.float16) if SAVE_FLOAT16 else arr.astype(np.float32))
+        t0 = time.monotonic()
+        stable = True
+        while time.monotonic() - t0 < DEBOUNCE_STABLE_S:
+            if gpio.input(button_pin) != gpio.LOW:
+                stable = False
+                break
+            time.sleep(0.005)
+        if not stable:
+            continue
+
+        while gpio.input(button_pin) == gpio.LOW:
+            time.sleep(0.005)
+
+        time.sleep(POST_PRESS_GUARD_S)
+        return
 
 # ============================================================
 # CAPTURE CORE
@@ -268,30 +293,28 @@ def _capture_avg_intensity(n: int) -> (np.ndarray, list):
         time.sleep(INTER_FRAME_GAP)
     return acc / float(n), times
 
-def capture_band_DI(band: str, led_pin: int, deadline_t: float):
+def capture_band_DI(band: str, led_pin: int, frames: int, deadline_t: float):
     ctrl = apply_capture_settings(band)
     time.sleep(CTRL_SETTLE)
     _deadline_ok(deadline_t)
-
-    n = FRAMES_PER_BAND[band]
 
     # DARK
     gpio.output(led_pin, gpio.LOW)
     time.sleep(LED_OFF_GAP)
     _deadline_ok(deadline_t)
-    D, d_times = _capture_avg_intensity(n)
+    D, d_times = _capture_avg_intensity(frames)
 
     # ON
     gpio.output(led_pin, gpio.HIGH)
     time.sleep(LED_SETTLE)
     _deadline_ok(deadline_t)
-    I, i_times = _capture_avg_intensity(n)
+    I, i_times = _capture_avg_intensity(frames)
 
     gpio.output(led_pin, gpio.LOW)
     time.sleep(LED_OFF_GAP)
 
     timing = {
-        "frames": n,
+        "frames": frames,
         "dark_frame_seconds": d_times,
         "on_frame_seconds": i_times,
         "dark_total_s": float(sum(d_times)),
@@ -300,11 +323,12 @@ def capture_band_DI(band: str, led_pin: int, deadline_t: float):
     return D, I, ctrl, timing
 
 # ============================================================
-# STILL (MUST BE UNCHANGED)
+# STILL (UNCHANGED)
 # ============================================================
 def take_still_unmodified(session_dir: str, session_num: int) -> str:
     """
-    Saves still.jpg EXACTLY as camera outputs (no processing).
+    Saves still JPG exactly as the camera outputs it.
+    No processing, no conversion, no edits.
     """
     apply_capture_settings("still")
     time.sleep(CTRL_SETTLE)
@@ -313,90 +337,106 @@ def take_still_unmodified(session_dir: str, session_num: int) -> str:
     return path
 
 # ============================================================
-# WHITE FIELD CAL
+# CAL + SCAN + PROCESS (cal and scan must be same position)
 # ============================================================
-def capture_white_reference(session_dir: str, session_num: int):
-    """
-    Captures and SAVES flat-field for each band.
-    Must be done in same position/pressure as scan.
-    """
-    oled_msg("CALIBRATION", "White-field", "Capturing...", "")
+def do_cal_and_scan(session_dir: str, session_num: int):
+    base = os.path.join(session_dir, f"{date.today()}-session{session_num:03d}")
     deadline_t = time.monotonic() + MAX_CAPTURE_SECONDS
 
+    # ---------------- CAL (capture-only) ----------------
+    oled_msg("CAL", "DO NOT MOVE", "Capturing...", "")
+    cal = {}
+    try:
+        oled_msg("CAL", "CAP 730", "", "")
+        cal["w730"] = capture_band_DI("w730", pins["w730"], CAL_FRAMES_PER_BAND["w730"], deadline_t)
+        oled_msg("CAL", "CAP 450", "", "")
+        cal["w450"] = capture_band_DI("w450", pins["w450"], CAL_FRAMES_PER_BAND["w450"], deadline_t)
+        oled_msg("CAL", "CAP 660", "", "")
+        cal["w660"] = capture_band_DI("w660", pins["w660"], CAL_FRAMES_PER_BAND["w660"], deadline_t)
+    except CaptureTimeout:
+        all_leds_off()
+        with open(base + "-TIMEOUT.txt", "w") as f:
+            f.write(f"Capture timed out after {MAX_CAPTURE_SECONDS} seconds\n")
+        oled_msg("TIMEOUT", "during CAL", "", "")
+        raise
+    finally:
+        all_leds_off()
+
     flats = {}
-    for band, nm in [("w730","730"), ("w450","450"), ("w660","660")]:
-        oled_msg("CALIBRATION", f"CAP {nm}nm", "", "")
-        D, I, ctrl, timing = capture_band_DI(band, pins[band], deadline_t)
+    for b in ["w730", "w450", "w660"]:
+        D, I, _, _ = cal[b]
         W = (I - D) + PEDESTAL_RAW
         W = np.clip(W, 0, RAW_MAX).astype(np.float32)
         W = _clip_percentile(W, CLIP_PCT)
-        flats[band] = (W, ctrl, timing)
+        flats[b] = W
 
-    for band in ["w730","w450","w660"]:
-        W, _, _ = flats[band]
-        _save_npy(_cal_path(band), W)
-
-    # optional save a copy inside session folder too
-    for band, nm in [("w730","730nm"), ("w450","450nm"), ("w660","660nm")]:
-        W, _, _ = flats[band]
-        out = os.path.join(session_dir, f"{date.today()}-session{session_num:03d}-flat-{nm}")
-        _save_npy(out + ".npy", W)
+    for b, nm in [("w730","730"), ("w450","450"), ("w660","660")]:
+        out = f"{base}-flat-{nm}nm"
+        _save_npy(out + ".npy", flats[b])
         if SAVE_PREVIEW_PNG:
-            _save_preview_png(out + "-preview.png", W)
+            _save_preview_png(out + "-preview.png", flats[b])
 
-    oled_msg("CALIBRATION", "Saved flats ✅", "", "Ready")
+    # ---------------- SCAN (capture-only) ----------------
+    oled_msg("SCAN", "DO NOT MOVE", "Capturing...", "")
+    scan = {}
+    try:
+        oled_msg("SCAN", "CAP 730", "", "")
+        scan["w730"] = capture_band_DI("w730", pins["w730"], SCAN_FRAMES_PER_BAND["w730"], deadline_t)
+        oled_msg("SCAN", "CAP 450", "", "")
+        scan["w450"] = capture_band_DI("w450", pins["w450"], SCAN_FRAMES_PER_BAND["w450"], deadline_t)
+        oled_msg("SCAN", "CAP 660", "", "")
+        scan["w660"] = capture_band_DI("w660", pins["w660"], SCAN_FRAMES_PER_BAND["w660"], deadline_t)
+    except CaptureTimeout:
+        all_leds_off()
+        with open(base + "-TIMEOUT.txt", "w") as f:
+            f.write(f"Capture timed out after {MAX_CAPTURE_SECONDS} seconds\n")
+        oled_msg("TIMEOUT", "during SCAN", "", "")
+        raise
+    finally:
+        all_leds_off()
 
-# ============================================================
-# SCAN + PROCESS
-# ============================================================
-def process_and_save(session_dir: str, session_num: int, captured: dict):
-    base = os.path.join(session_dir, f"{date.today()}-session{session_num:03d}")
-    oled_msg("MSI Scanner", f"Session {session_num}", "PROCESSING...", "")
-
-    flats = None
-    if have_calibration():
-        flats = {b: np.load(_cal_path(b)).astype(np.float32) for b in ["w730","w450","w660"]}
+    # ---------------- PROCESS/SAVE (unbounded) ----------------
+    oled_msg("PROCESSING", "", "", "")
 
     corr = {}
     meta = {
         "session_num": session_num,
         "timestamp": datetime.now().isoformat(),
-        "frames_per_band": FRAMES_PER_BAND,
         "crop": {"enabled": USE_CENTER_CROP, "size": CROP_SIZE},
-        "dark_subtraction": True,
-        "flat_field_used": bool(flats is not None),
+        "cal_frames_per_band": CAL_FRAMES_PER_BAND,
+        "scan_frames_per_band": SCAN_FRAMES_PER_BAND,
         "pedestal_raw": PEDESTAL_RAW,
         "clip_percentiles": CLIP_PCT,
         "bands": {},
+        "ml_tensor": None,
     }
 
-    for band, nm in [("w730","730nm"), ("w450","450nm"), ("w660","660nm")]:
-        D, I, ctrl, timing = captured[band]
+    for band, nm in [("w730", "730nm"), ("w450", "450nm"), ("w660", "660nm")]:
+        D, I, ctrl, timing = scan[band]
         X = (I - D) + PEDESTAL_RAW
         X = np.clip(X, 0, RAW_MAX).astype(np.float32)
 
-        if flats is not None:
-            X = X / (flats[band] + EPS)
-
+        # flat-field normalization (session-local flats)
+        X = X / (flats[band] + EPS)
         X = _clip_percentile(X, CLIP_PCT)
         corr[band] = X
 
-        meta["bands"][band] = {"name": nm, "camera_controls": ctrl, "timings": timing}
+        meta["bands"][band] = {
+            "name": nm,
+            "camera_controls": ctrl,
+            "timings": timing,
+        }
 
-        if SAVE_PER_BAND_CORRECTED:
-            out_band = f"{base}-{nm}-corr"
-            _save_npy(out_band + ".npy", X)
+        if SAVE_PER_BAND_CORR:
+            out = f"{base}-{nm}-corr"
+            _save_npy(out + ".npy", X)
             if SAVE_PREVIEW_PNG:
-                _save_preview_png(out_band + "-preview.png", X)
+                _save_preview_png(out + "-preview.png", X)
 
-    if SAVE_ML_TENSOR:
-        r_660_730 = corr["w660"] / (corr["w730"] + EPS)
-        r_450_660 = corr["w450"] / (corr["w660"] + EPS)
-        r_450_730 = corr["w450"] / (corr["w730"] + EPS)
-
-        r_660_730 = _clip_percentile(r_660_730, CLIP_PCT)
-        r_450_660 = _clip_percentile(r_450_660, CLIP_PCT)
-        r_450_730 = _clip_percentile(r_450_730, CLIP_PCT)
+    if SAVE_ML_RATIOS:
+        r_660_730 = _clip_percentile(corr["w660"] / (corr["w730"] + EPS), CLIP_PCT)
+        r_450_660 = _clip_percentile(corr["w450"] / (corr["w660"] + EPS), CLIP_PCT)
+        r_450_730 = _clip_percentile(corr["w450"] / (corr["w730"] + EPS), CLIP_PCT)
 
         tensor = np.stack([r_660_730, r_450_660, r_450_730], axis=-1).astype(np.float32)
         out_ml = f"{base}-ML-ratios"
@@ -407,132 +447,72 @@ def process_and_save(session_dir: str, session_num: int, captured: dict):
             _save_preview_png(out_ml + "-ch1-450over660.png", tensor[..., 1])
             _save_preview_png(out_ml + "-ch2-450over730.png", tensor[..., 2])
 
-        meta["ml_tensor"] = {"file": os.path.basename(out_ml + ".npy"),
-                             "channels": ["660/730", "450/660", "450/730"]}
+        meta["ml_tensor"] = {
+            "file": os.path.basename(out_ml + ".npy"),
+            "channels": ["660/730", "450/660", "450/730"],
+        }
 
     with open(base + "-meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
-    oled_msg("MSI Scanner", f"Session {session_num}", "DONE ✅", "Saved ML tensor")
-
-def run_scan(session_dir: str, session_num: int):
-    deadline_t = time.monotonic() + MAX_CAPTURE_SECONDS
-    base = os.path.join(session_dir, f"{date.today()}-session{session_num:03d}")
-
-    captured = {}
-    t0 = time.monotonic()
-    try:
-        oled_msg("MSI Scanner", f"Session {session_num}", "CAPTURE 730", "")
-        captured["w730"] = capture_band_DI("w730", pins["w730"], deadline_t)
-
-        oled_msg("MSI Scanner", f"Session {session_num}", "CAPTURE 450", "")
-        captured["w450"] = capture_band_DI("w450", pins["w450"], deadline_t)
-
-        oled_msg("MSI Scanner", f"Session {session_num}", "CAPTURE 660", "")
-        captured["w660"] = capture_band_DI("w660", pins["w660"], deadline_t)
-
-    except CaptureTimeout:
-        all_leds_off()
-        with open(base + "-TIMEOUT.txt", "w") as f:
-            f.write(f"Capture timed out after {MAX_CAPTURE_SECONDS} seconds\n")
-        oled_msg("MSI Scanner", f"Session {session_num}", "TIMEOUT", "")
-        raise
-    finally:
-        all_leds_off()
-
-    cap_s = time.monotonic() - t0
-    oled_msg("MSI Scanner", f"Session {session_num}", f"CAP OK {cap_s:.1f}s", "PROCESSING...")
-    process_and_save(session_dir, session_num, captured)
+    oled_msg("DONE ✅", f"Session {session_num}", "Saved", "")
 
 # ============================================================
-# MAIN STATE MACHINE
+# MAIN LOOP (hard-coded, impossible to "instant scan")
 # ============================================================
-last_state = gpio.input(button_pin)
-press_start = None
-last_idle = 0.0
-
-session_counter = 0
-session_dir = None
-stage = "IDLE"  # IDLE -> HAVE_STILL -> (CAL optional) -> SCAN
-
 def main():
-    global last_state, press_start, last_idle
-    global session_counter, session_dir, stage
+    session_counter = 0
+    stage = "WAIT_STILL"   # WAIT_STILL -> WAIT_CALSCAN
+    session_dir = None
+    session_num = None
 
-    oled_msg("MSI Scanner", "READY", "Press=STILL", "After: hold=CAL")
+    oled_msg("MSI Scanner", "READY", "Press: STILL", "")
 
     try:
         while True:
-            state = gpio.input(button_pin)
-            now = time.monotonic()
+            wait_for_debounced_press()
 
-            # idle UI refresh
-            if now - last_idle > 0.6:
-                cal = "Cal: OK" if have_calibration() else "Cal: none"
-                oled_msg("MSI Scanner", f"Stage: {stage}", cal, "Press/hold btn")
-                last_idle = now
+            if stage == "WAIT_STILL":
+                session_counter += 1
+                session_num = session_counter
+                session_dir = _new_session_dir(session_num)
 
-            # press start
-            if state == gpio.LOW and press_start is None:
-                press_start = now
+                oled_msg("MSI Scanner", f"Session {session_num}", "Taking STILL...", "")
+                take_still_unmodified(session_dir, session_num)
 
-            # release edge
-            if state == gpio.HIGH and last_state == gpio.LOW:
-                held = 0.0 if press_start is None else (now - press_start)
-                press_start = None
+                oled_msg("MSI Scanner",
+                         f"Session {session_num}",
+                         "STILL saved ✅",
+                         "Press: CALIBRATION+SCAN")
+                stage = "WAIT_CALSCAN"
 
-                # Stage logic
-                if stage == "IDLE":
-                    # First action MUST be still
-                    session_counter += 1
-                    session_dir = _new_session_dir(session_counter)
-                    oled_msg("MSI Scanner", f"Session {session_counter}", "STILL...", "")
-                    take_still_unmodified(session_dir, session_counter)
-                    oled_msg("MSI Scanner", f"Session {session_counter}", "STILL saved ✅",
-                             "Hold=CAL")
-                    stage = "HAVE_STILL"
-                    continue
+            elif stage == "WAIT_CALSCAN":
+                oled_msg("MSI Scanner", f"Session {session_num}", "Starting CAL+SCAN", "DO NOT MOVE")
+                try:
+                    do_cal_and_scan(session_dir, session_num)
+                except Exception:
+                    oled_msg("ERROR", f"Session {session_num}", "Check files", "")
+                    time.sleep(1.0)
+                finally:
+                    all_leds_off()
 
-                if stage == "HAVE_STILL":
-                    # After still: hold=cal, short=scan
-                    if held >= LONG_PRESS_S:
-                        # calibration
-                        try:
-                            capture_white_reference(session_dir, session_counter)
-                            time.sleep(0.4)
-                            oled_msg("MSI Scanner", f"Session {session_counter}",
-                                     "READY", "Press=SCAN")
-                        except Exception:
-                            oled_msg("CALIBRATION", "FAILED", "", "")
-                            time.sleep(0.8)
-                        continue
-                    else:
-                        # scan
-                        try:
-                            run_scan(session_dir, session_counter)
-                        except Exception:
-                            oled_msg("MSI Scanner", f"Session {session_counter}", "ERROR", "", "")
-                            time.sleep(0.8)
-                        finally:
-                            session_dir = None
-                            stage = "IDLE"
-                            oled_msg("MSI Scanner", "READY", "Press=STILL", "After: hold=CAL")
-                        continue
-
-            last_state = state
-            time.sleep(0.02)
+                # reset for next patient
+                stage = "WAIT_STILL"
+                session_dir = None
+                session_num = None
+                oled_msg("MSI Scanner", "READY", "Press: STILL", "")
 
     except KeyboardInterrupt:
         pass
     finally:
         all_leds_off()
         try:
-            if device:
-                device.display(Image.new("1", (WIDTH, HEIGHT)))
+            cam.stop()
         except Exception:
             pass
         try:
-            cam.stop()
+            if device:
+                device.display(Image.new("1", (WIDTH, HEIGHT)))
         except Exception:
             pass
         gpio.cleanup()

@@ -70,7 +70,7 @@ MIN_SECONDS_BETWEEN_PRESSES = 1.2
 gpio.setmode(gpio.BCM)
 
 pins = {
-    "w730": 22,
+    "w730": 17,
     "w660": 23,
 }
 button_pin = 26
@@ -116,9 +116,9 @@ cam.set_controls({
 
 # IMPORTANT: fixed settings per band (no per-image normalization anywhere)
 CAPTURE_SETTINGS = {
-    "still": {"ExposureTime": 3500,  "AnalogueGain": 1.0, "LensPosition": 7.5},
-    "w730":  {"ExposureTime": 20000, "AnalogueGain": 1.5, "LensPosition": 7.5},
-    "w660":  {"ExposureTime": 20000, "AnalogueGain": 1.5, "LensPosition": 7.5},
+    "still": {"ExposureTime": 2500,  "AnalogueGain": 1.0, "LensPosition": 7.5},
+    "w730":  {"ExposureTime": 23000, "AnalogueGain": 1.5, "LensPosition": 7.5},
+    "w660":  {"ExposureTime": 30000, "AnalogueGain": 1.5, "LensPosition": 7.5},
 }
 
 def apply_capture_settings(key: str) -> dict:

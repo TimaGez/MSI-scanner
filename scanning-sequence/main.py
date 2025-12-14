@@ -3,10 +3,8 @@ import time
 import json
 import signal
 import atexit
-import threading
 import numpy as np
 import RPi.GPIO as gpio
-
 from datetime import date, datetime
 from picamera2 import Picamera2
 from PIL import Image, ImageDraw, ImageFont
@@ -14,28 +12,30 @@ from luma.core.interface.serial import i2c
 from luma.oled.device import ssd1306
 
 # ============================================================
-# GUARANTEES / LIMITS
+# GOAL: LED/capture <= 20s, processing can take longer
 # ============================================================
-MAX_SCAN_SECONDS = 25.0        # total sequence cap
-FRAMES_PER_BAND = 2            # keep 2; we’ll fix stalls properly
-CAPTURE_TIMEOUT_S = 1.2        # per raw frame capture timeout
-CAPTURE_RETRIES = 2            # retry a blocked capture a couple times
+MAX_SCAN_SECONDS = 20.0     # ONLY applies to capture (LED time)
+FRAMES_PER_BAND = 1         # MUST be 1 with your current 3s/frame behavior
 
+# ROI crop for speed + consistency
 USE_CENTER_CROP = True
 CROP_SIZE = 700
 
+# Output
 SAVE_NPY_FLOAT16 = True
 SAVE_PREVIEW_PNG = True
 SAVE_16BIT_PNG = False
 
+# Small pedestal after dark subtraction (prevents all-zero output)
+PEDESTAL_RAW = 30.0
+
+# Settles (fast)
 CTRL_SETTLE = 0.04
-LED_SETTLE  = 0.02             # small; we pulse per frame now
-LED_OFF_GAP = 0.01
-INTER_FRAME_GAP = 0.002
+LED_SETTLE  = 0.06
+LED_OFF_GAP = 0.02
 
 RAW_BIT_DEPTH = 10
 RAW_MAX = (1 << RAW_BIT_DEPTH) - 1  # 1023
-PEDESTAL_RAW = 30.0
 
 # ============================================================
 # GPIO
@@ -120,6 +120,15 @@ WIDTH = device.width
 HEIGHT = device.height
 font = ImageFont.load_default()
 
+def oled_msg(line1: str, line2: str = "", line3: str = "", line4: str = ""):
+    image = Image.new("1", (WIDTH, HEIGHT))
+    draw = ImageDraw.Draw(image)
+    draw.text((0, 0),  line1[:21], font=font, fill=255)
+    draw.text((0, 16), line2[:21], font=font, fill=255)
+    draw.text((0, 32), line3[:21], font=font, fill=255)
+    draw.text((0, 48), line4[:21], font=font, fill=255)
+    device.display(image)
+
 # ============================================================
 # SIGNAL SAFETY
 # ============================================================
@@ -143,7 +152,7 @@ signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 # ============================================================
-# HELPERS
+# IO / IMAGE HELPERS
 # ============================================================
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -175,7 +184,7 @@ def _split_rggb_planes(raw: np.ndarray):
 def _raw_to_intensity(raw: np.ndarray) -> np.ndarray:
     R, G, B = _split_rggb_planes(raw)
     I = (R + 2.0*G + B) * 0.25
-    return _center_crop(I, CROP_SIZE)
+    return _center_crop(I, CROP_SIZE).astype(np.float32)
 
 def _to_u16(img: np.ndarray) -> np.ndarray:
     x = np.clip(img, 0, RAW_MAX)
@@ -202,135 +211,66 @@ def _save_outputs(out_base: str, img_f32: np.ndarray, meta: dict) -> None:
         json.dump(meta, f, indent=2)
 
 # ============================================================
-# TIMEOUTS
+# CAPTURE (FAST) + PROCESS (AFTER)
 # ============================================================
 class ScanTimeout(Exception):
     pass
 
-class FrameTimeout(Exception):
-    pass
-
-def _check_deadline(deadline_t: float):
+def _deadline_ok(deadline_t: float):
     if time.monotonic() > deadline_t:
         raise ScanTimeout("Scan exceeded MAX_SCAN_SECONDS")
 
-# ============================================================
-# SAFE FRAME CAPTURE (prevents hanging forever)
-# ============================================================
-def _capture_raw_with_timeout(timeout_s: float) -> np.ndarray:
-    result = {}
-    exc = {}
-
-    def worker():
-        try:
-            result["raw"] = cam.capture_array("raw")
-        except Exception as e:
-            exc["e"] = e
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    t.join(timeout=timeout_s)
-
-    if t.is_alive():
-        raise FrameTimeout(f"cam.capture_array('raw') exceeded {timeout_s}s")
-
-    if "e" in exc:
-        raise exc["e"]
-
-    return result["raw"]
-
-def _capture_intensity_frame(deadline_t: float) -> np.ndarray:
-    _check_deadline(deadline_t)
-    raw = _capture_raw_with_timeout(CAPTURE_TIMEOUT_S)
-    return _raw_to_intensity(raw).astype(np.float32)
-
-# ============================================================
-# CAPTURE CORE (LED PULSED PER FRAME)
-# ============================================================
-def _avg_stack_pulsed(n: int, led_pin: int, led_on: bool, deadline_t: float) -> (np.ndarray, list):
+def _capture_n_intensity(n: int) -> (np.ndarray, list):
     """
-    Captures n frames. If led_on=True, LED is pulsed for each frame capture
-    to prevent it staying on during any unexpected stall.
-    Returns average + list of per-frame capture durations.
+    Capture n intensity frames (no LED control inside).
+    Returns average + list of capture durations.
     """
     acc = None
-    durations = []
-
+    times = []
     for _ in range(n):
-        _check_deadline(deadline_t)
-
-        if led_on:
-            gpio.output(led_pin, gpio.HIGH)
-            time.sleep(LED_SETTLE)
-        else:
-            gpio.output(led_pin, gpio.LOW)
-            time.sleep(LED_OFF_GAP)
-
         t0 = time.monotonic()
-        frame = None
-
-        # retry if capture blocks
-        for attempt in range(CAPTURE_RETRIES + 1):
-            try:
-                frame = _capture_intensity_frame(deadline_t)
-                break
-            except FrameTimeout:
-                # turn LED off immediately and retry
-                gpio.output(led_pin, gpio.LOW)
-                time.sleep(LED_OFF_GAP)
-                if attempt == CAPTURE_RETRIES:
-                    raise
-                time.sleep(0.02)
-
-        # LED off immediately after frame
-        gpio.output(led_pin, gpio.LOW)
-        time.sleep(LED_OFF_GAP)
-
+        raw = cam.capture_array("raw")
+        frame = _raw_to_intensity(raw)
         dt = time.monotonic() - t0
-        durations.append(dt)
-
+        times.append(dt)
         if acc is None:
             acc = frame
         else:
             acc += frame
+    return acc / float(n), times
 
-        time.sleep(INTER_FRAME_GAP)
-
-    return acc / float(n), durations
-
-def capture_band(key: str, out_base: str, led_pin: int, deadline_t: float) -> None:
+def scan_band_capture_only(key: str, led_pin: int, deadline_t: float):
+    """
+    CAPTURE-ONLY: returns (D, I, ctrl_meta, timing_meta)
+    Processing/saving happens later (unbounded).
+    """
     ctrl = apply_capture_settings(key)
     time.sleep(CTRL_SETTLE)
-    _check_deadline(deadline_t)
+    _deadline_ok(deadline_t)
 
-    # DARK average (LED OFF, pulsed off anyway)
-    D, d_times = _avg_stack_pulsed(FRAMES_PER_BAND, led_pin, led_on=False, deadline_t=deadline_t)
+    # DARK (LED off)
+    gpio.output(led_pin, gpio.LOW)
+    time.sleep(LED_OFF_GAP)
+    _deadline_ok(deadline_t)
+    D, d_times = _capture_n_intensity(FRAMES_PER_BAND)
 
-    # ON average (LED pulsed per frame)
-    I, i_times = _avg_stack_pulsed(FRAMES_PER_BAND, led_pin, led_on=True, deadline_t=deadline_t)
+    # ON (LED on)
+    gpio.output(led_pin, gpio.HIGH)
+    time.sleep(LED_SETTLE)
+    _deadline_ok(deadline_t)
+    I, i_times = _capture_n_intensity(FRAMES_PER_BAND)
 
-    X = (I - D) + PEDESTAL_RAW
-    X = np.clip(X, 0, RAW_MAX)
+    # Turn LED off immediately after last capture
+    gpio.output(led_pin, gpio.LOW)
+    time.sleep(LED_OFF_GAP)
 
-    meta = {
-        "band": key,
-        "frames_per_band": FRAMES_PER_BAND,
-        "capture_timeout_s": CAPTURE_TIMEOUT_S,
-        "capture_retries": CAPTURE_RETRIES,
-        "dark_subtraction": True,
-        "pedestal_raw": PEDESTAL_RAW,
-        "crop": {"enabled": USE_CENTER_CROP, "size": CROP_SIZE},
-        "camera_controls": ctrl,
-        "raw_bit_depth": RAW_BIT_DEPTH,
-        "timings": {
-            "dark_frame_seconds": d_times,
-            "on_frame_seconds": i_times,
-            "dark_total_s": float(sum(d_times)),
-            "on_total_s": float(sum(i_times)),
-        },
-        "timestamp": datetime.now().isoformat(),
+    timing = {
+        "dark_frame_seconds": d_times,
+        "on_frame_seconds": i_times,
+        "dark_total_s": float(sum(d_times)),
+        "on_total_s": float(sum(i_times)),
     }
-    _save_outputs(out_base, X, meta)
+    return D, I, ctrl, timing
 
 def take_still(scan_dir: str, scan_num: int) -> None:
     apply_capture_settings("still")
@@ -338,23 +278,68 @@ def take_still(scan_dir: str, scan_num: int) -> None:
     cam.capture_file(os.path.join(scan_dir, f"{date.today()}-scan{scan_num:03d}-still.jpg"))
 
 def sequence(scan_dir: str, scan_num: int) -> None:
-    deadline_t = time.monotonic() + MAX_SCAN_SECONDS
+    """
+    Stage 1 (bounded): capture D/I for each band quickly, LEDs on only during capture.
+    Stage 2 (unbounded): processing + saving (OLED says PROCESSING).
+    """
     base = os.path.join(scan_dir, f"{date.today()}-scan{scan_num:03d}")
+    deadline_t = time.monotonic() + MAX_SCAN_SECONDS
 
+    oled_msg("MSI Scanner", f"Scan {scan_num}", "CAPTURING...", "")
+    t_scan0 = time.monotonic()
+
+    # -------- CAPTURE ONLY (bounded) --------
+    captured = {}  # key -> (D, I, ctrl, timing)
     try:
-        capture_band("w730", base + "-730nm", pins["w730"], deadline_t)
-        capture_band("w450", base + "-450nm", pins["w450"], deadline_t)
-        capture_band("w660", base + "-660nm", pins["w660"], deadline_t)
+        # order: 730, 450, 660
+        oled_msg("MSI Scanner", f"Scan {scan_num}", "CAPTURE 730", "")
+        captured["w730"] = scan_band_capture_only("w730", pins["w730"], deadline_t)
+
+        oled_msg("MSI Scanner", f"Scan {scan_num}", "CAPTURE 450", "")
+        captured["w450"] = scan_band_capture_only("w450", pins["w450"], deadline_t)
+
+        oled_msg("MSI Scanner", f"Scan {scan_num}", "CAPTURE 660", "")
+        captured["w660"] = scan_band_capture_only("w660", pins["w660"], deadline_t)
+
     except ScanTimeout:
         all_leds_off()
         with open(base + "-TIMEOUT.txt", "w") as f:
             f.write(f"Timed out after {MAX_SCAN_SECONDS} seconds\n")
         raise
-    except FrameTimeout as e:
+    finally:
         all_leds_off()
-        with open(base + "-FRAME_TIMEOUT.txt", "w") as f:
-            f.write(str(e) + "\n")
-        raise
+
+    t_scan = time.monotonic() - t_scan0
+
+    # -------- PROCESS + SAVE (unbounded) --------
+    oled_msg("MSI Scanner", f"Scan {scan_num}", "PROCESSING...", "")
+    t_proc0 = time.monotonic()
+
+    for key, (D, I, ctrl, timing) in captured.items():
+        nm = {"w730": "730nm", "w450": "450nm", "w660": "660nm"}[key]
+        out_base = f"{base}-{nm}"
+
+        X = (I - D) + PEDESTAL_RAW
+        X = np.clip(X, 0, RAW_MAX)
+
+        meta = {
+            "band": key,
+            "frames_per_band": FRAMES_PER_BAND,
+            "dark_subtraction": True,
+            "pedestal_raw": PEDESTAL_RAW,
+            "crop": {"enabled": USE_CENTER_CROP, "size": CROP_SIZE},
+            "camera_controls": ctrl,
+            "raw_bit_depth": RAW_BIT_DEPTH,
+            "timings": timing,
+            "capture_scan_total_s": float(t_scan),
+            "timestamp": datetime.now().isoformat(),
+        }
+        _save_outputs(out_base, X, meta)
+
+        oled_msg("MSI Scanner", f"Scan {scan_num}", "PROCESSING...", nm)
+
+    t_proc = time.monotonic() - t_proc0
+    oled_msg("MSI Scanner", f"Scan {scan_num}", "DONE", f"cap:{t_scan:.1f}s", f"proc:{t_proc:.1f}s")
 
 # ============================================================
 # MAIN LOOP
@@ -364,20 +349,8 @@ scan_counter = 0
 press_counter = 0
 current_scan_dir = None
 
-def oled_status(state: int, scan_counter: int, press_counter: int, msg: str = ""):
-    image = Image.new("1", (WIDTH, HEIGHT))
-    draw = ImageDraw.Draw(image)
-    draw.text((0, 0), "MSI Scanner", font=font, fill=255)
-    draw.text((0, 16), f"Scan #: {scan_counter}", font=font, fill=255)
-    next_phase = "STILL" if (press_counter % 2 == 0) else "SCAN"
-    draw.text((0, 32), f"Next: {next_phase}", font=font, fill=255)
-    btn_txt = "PRESSED" if state == gpio.LOW else "released"
-    draw.text((0, 48), (btn_txt + " " + msg)[:21], font=font, fill=255)
-    device.display(image)
-
 def main():
     global last_state, scan_counter, press_counter, current_scan_dir
-
     try:
         while True:
             state = gpio.input(button_pin)
@@ -388,27 +361,24 @@ def main():
 
                 if press_counter % 2 == 1:
                     current_scan_dir = _new_scan_dir(next_scan_num)
-                    oled_status(state, scan_counter, press_counter, "STILL")
+                    oled_msg("MSI Scanner", f"Scan {next_scan_num}", "STILL...", "")
                     take_still(current_scan_dir, next_scan_num)
-                    oled_status(state, scan_counter, press_counter, "READY")
+                    oled_msg("MSI Scanner", f"Scan {next_scan_num}", "READY", "Press again", "to scan")
                 else:
                     if not current_scan_dir:
                         current_scan_dir = _new_scan_dir(next_scan_num)
                         take_still(current_scan_dir, next_scan_num)
 
-                    oled_status(state, scan_counter, press_counter, "SCAN...")
                     try:
                         sequence(current_scan_dir, next_scan_num)
                         scan_counter += 1
-                        oled_status(state, scan_counter, press_counter, "DONE")
                     except Exception:
-                        oled_status(state, scan_counter, press_counter, "ERR")
+                        oled_msg("MSI Scanner", f"Scan {next_scan_num}", "ERROR", "", "")
                     finally:
                         current_scan_dir = None
                         all_leds_off()
 
             last_state = state
-            oled_status(state, scan_counter, press_counter)
             time.sleep(0.02)
 
     except KeyboardInterrupt:

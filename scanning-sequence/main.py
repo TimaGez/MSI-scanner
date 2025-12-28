@@ -13,50 +13,35 @@ from PIL import Image, ImageDraw, ImageFont
 from luma.core.interface.serial import i2c
 from luma.oled.device import ssd1306
 
-# ============================================================
-# HARD-CODED WORKFLOW
-#   Press #1 -> STILL (unchanged JPG, color)
-#   Press #2 -> CAL then SCAN (back-to-back, DO NOT MOVE)
-#
-# Bands used:
-#   ✅ 730nm, 660nm
-#   🚫 450nm: fully removed
-# ============================================================
+MAX_CAPTURE_SECONDS = 60.0 
 
-# --------- CAPTURE BUDGET ---------
-MAX_CAPTURE_SECONDS = 60.0  # you requested 60 sec
-
-# --------- SENSOR / RAW SETTINGS ---------
 RAW_BIT_DEPTH = 10
 RAW_MAX = (1 << RAW_BIT_DEPTH) - 1
 
-# Subtract a global dark frame (1 frame) and add a tiny pedestal to avoid divide-by-zero
+# subtract  global dark frame, add tiny pedestal to avoid division by zero
 EPS = 1e-6
-PEDESTAL = 20.0  # small offset after dark subtraction
+PEDESTAL = 20.0
 
-# Strict clipping rules: if too many pixels are near 0 or near max, we refuse to save
+# if too many pixels near 0 or max, refuse to save
 CLIP_HIGH_THRESH = int(0.98 * RAW_MAX)   # "near saturation"
 CLIP_LOW_THRESH  = int(0.01 * RAW_MAX)   # "near black"
 MAX_CLIP_FRAC = 0.003                    # max allowed fraction clipped (0.3%)
 
-# --------- ROI (crop + circular mask) ---------
 USE_CENTER_CROP = True
 CROP_SIZE = 700
 
 USE_CIRCULAR_MASK = True
-CIRCULAR_MASK_FRAC = 0.47  # radius fraction; tune 0.42-0.48
+CIRCULAR_MASK_FRAC = 0.47
 
-# --------- PREVIEW ONLY (DO NOT AFFECT ML ARRAYS) ---------
 SAVE_PREVIEW_PNG = True
-PREVIEW_CLIP_PCT = (2, 98)  # only for PNG previews
+PREVIEW_CLIP_PCT = (2, 98)
 
-# --------- OUTPUT ---------
 SAVE_FLOAT16 = True  # smaller files
-SAVE_PER_BAND_RAW = True     # save dark-subtracted intensity (masked)
-SAVE_PER_BAND_CORR = True    # save flat-field corrected reflectance-like
-SAVE_ML_TENSOR = True        # save [660_corr, 730_corr, 660/730]
+SAVE_PER_BAND_RAW = True
+SAVE_PER_BAND_CORR = True
+SAVE_ML_TENSOR = True
 
-# --------- TIMING ---------
+# timing
 CTRL_SETTLE = 0.03
 LED_SETTLE  = 0.06
 LED_OFF_GAP = 0.02
@@ -64,15 +49,13 @@ POST_PRESS_GUARD_S = 0.45
 DEBOUNCE_STABLE_S = 0.06
 MIN_SECONDS_BETWEEN_PRESSES = 1.2
 
-# ============================================================
-# GPIO
-# ============================================================
 gpio.setmode(gpio.BCM)
 
 pins = {
     "w730": 17,
     "w660": 23,
 }
+
 button_pin = 26
 
 for p in pins.values():
@@ -90,9 +73,7 @@ def all_leds_off():
 
 atexit.register(all_leds_off)
 
-# ============================================================
-# CAMERA
-# ============================================================
+
 cam = Picamera2()
 cam.configure(cam.create_still_configuration(
     main={"format": "YUV420"},
@@ -101,7 +82,7 @@ cam.configure(cam.create_still_configuration(
 cam.start()
 time.sleep(0.6)
 
-# Lock focus + disable auto
+# disable auto everything
 cam.set_controls({
     "AfMode": 0,
     "LensPosition": 7.5,
@@ -114,7 +95,7 @@ cam.set_controls({
     "NoiseReductionMode": 0,
 })
 
-# IMPORTANT: fixed settings per band (no per-image normalization anywhere)
+# per-band settings
 CAPTURE_SETTINGS = {
     "still": {"ExposureTime": 2500,  "AnalogueGain": 1.0, "LensPosition": 7.5},
     "w730":  {"ExposureTime": 23000, "AnalogueGain": 1.5, "LensPosition": 7.5},
@@ -137,7 +118,6 @@ def apply_capture_settings(key: str) -> dict:
     }
 
 def capture_raw_array() -> np.ndarray:
-    # Faster + less overhead than cam.capture_array("raw")
     req = cam.capture_request()
     try:
         raw = req.make_array("raw")
@@ -145,16 +125,14 @@ def capture_raw_array() -> np.ndarray:
         req.release()
     return raw
 
-# ============================================================
-# OLED (boot-reliable)
-# ============================================================
+# OLED screen
 font = ImageFont.load_default()
 
 def init_oled_with_retry(max_tries: int = 12, delay_s: float = 0.35):
     last_err = None
     for i in range(1, max_tries + 1):
         try:
-            serial = i2c(port=1, address=0x3C)  # change to 0x3D if needed
+            serial = i2c(port=1, address=0x3C)
             dev = ssd1306(serial, width=128, height=64)
             dev.contrast(255)
             img = Image.new("1", (dev.width, dev.height))
@@ -175,7 +153,6 @@ WIDTH = device.width if device else 128
 HEIGHT = device.height if device else 64
 
 def oled_msg(a="", b="", c="", d=""):
-    # ALWAYS exactly 4 args max
     if device is None:
         return
     img = Image.new("1", (WIDTH, HEIGHT))
@@ -186,9 +163,6 @@ def oled_msg(a="", b="", c="", d=""):
     draw.text((0, 48), d[:21], font=font, fill=255)
     device.display(img)
 
-# ============================================================
-# SAFETY SIGNALS
-# ============================================================
 def _handle_signal(signum, frame):
     all_leds_off()
     try:
@@ -209,9 +183,7 @@ def _handle_signal(signum, frame):
 signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
-# ============================================================
-# HELPERS: ROI / MASK / SAVE
-# ============================================================
+# helpers for scan processing
 class CaptureAbort(Exception):
     pass
 
@@ -251,10 +223,8 @@ def _split_rggb_planes(raw: np.ndarray):
 
 def raw_to_intensity_masked(raw: np.ndarray) -> (np.ndarray, np.ndarray):
     """
-    Convert SRGGB10 raw -> simple intensity proxy:
-      I = (R + 2G + B)/4
-    Then crop + circular mask EARLY (so ML never sees housing)
-    Returns: (I_masked, mask_float32)
+    Convert SRGGB10 raw;
+    crop + circular mask
     """
     R, G, B = _split_rggb_planes(raw)
     I = (R + 2.0*G + B) * 0.25
@@ -282,8 +252,8 @@ def _save_preview_png(path: str, img_f32: np.ndarray):
 
 def check_clipping(x: np.ndarray, mask: np.ndarray, label: str):
     """
-    Ensures the masked ROI is not saturated or crushed.
-    If it is, abort CAL+SCAN so you don't save poison data.
+    makes sure masked ROI is not saturated or crushed
+    if so, abort scan to ensure only good data
     """
     roi = x[mask > 0.5]
     if roi.size < 1000:
@@ -300,9 +270,7 @@ def check_clipping(x: np.ndarray, mask: np.ndarray, label: str):
         )
     return {"hi_clip_frac": hi_frac, "lo_clip_frac": lo_frac}
 
-# ============================================================
-# BUTTON (debounced press)
-# ============================================================
+# button
 _last_press_time = 0.0
 
 def wait_for_debounced_press():
@@ -332,9 +300,7 @@ def wait_for_debounced_press():
         _last_press_time = now
         return
 
-# ============================================================
-# STILL (UNCHANGED)
-# ============================================================
+# still image
 def take_still_unmodified(session_dir: str, session_num: int) -> str:
     apply_capture_settings("still")
     time.sleep(CTRL_SETTLE)
@@ -342,9 +308,7 @@ def take_still_unmodified(session_dir: str, session_num: int) -> str:
     cam.capture_file(path)  # do not touch
     return path
 
-# ============================================================
-# CAPTURE: single-frame per LED state (FIX)
-# ============================================================
+# scan capture (1 per led)
 def capture_dark_single(deadline_t: float):
     if time.monotonic() > deadline_t:
         raise CaptureAbort("Time budget exceeded before DARK")
@@ -370,9 +334,7 @@ def capture_band_single(band: str, led_pin: int, deadline_t: float):
     time.sleep(LED_OFF_GAP)
     return I, mask, ctrl
 
-# ============================================================
-# CAL + SCAN (strictly validated)
-# ============================================================
+# calibration + scan sequence
 def do_cal_and_scan(session_dir: str, session_num: int):
     base = os.path.join(session_dir, f"{date.today()}-session{session_num:03d}")
     deadline_t = time.monotonic() + MAX_CAPTURE_SECONDS
@@ -396,7 +358,7 @@ def do_cal_and_scan(session_dir: str, session_num: int):
         "bands": {}
     }
 
-    # ---- DARK (single frame) ----
+    # dark frame
     oled_msg("CAL+SCAN", "DO NOT MOVE", "DARK (1 frame)", "")
     D, mask = capture_dark_single(deadline_t)
     meta["dark"] = {
@@ -404,18 +366,18 @@ def do_cal_and_scan(session_dir: str, session_num: int):
         "mean": float(np.mean(D[mask > 0.5])),
     }
 
-    # ---- CAL (flat) for 730 then 660 ----
+    # calibration
     flats = {}
 
     for band, nm in [("w730", "730"), ("w660", "660")]:
         oled_msg("CAL", f"{nm}nm ON", "1 frame", "")
         I_on, mask2, ctrl = capture_band_single(band, pins[band], deadline_t)
 
-        # Ensure mask consistent
+        # ensure mask is regular shape
         if mask2.shape != mask.shape:
             raise CaptureAbort("Mask shape mismatch (crop/mask instability)")
 
-        # Dark-subtracted, pedestal added
+        # dark subtracted, pedestal added
         W = (I_on - D) + PEDESTAL
         W = np.clip(W, 0, RAW_MAX).astype(np.float32)
 
@@ -436,7 +398,7 @@ def do_cal_and_scan(session_dir: str, session_num: int):
             if SAVE_PREVIEW_PNG:
                 _save_preview_png(out + "-preview.png", W)
 
-    # ---- SCAN for 730 then 660 ----
+    # actual scan
     corr = {}
     rawscan = {}
 
@@ -453,7 +415,7 @@ def do_cal_and_scan(session_dir: str, session_num: int):
         clip_stats = check_clipping(X, mask, f"SCAN {nm}nm")
         rawscan[band] = X
 
-        # Flat-field correction (NO CLIPPING, NO NORMALIZATION)
+        # flat-field correction
         Xcorr = X / (flats[band] + EPS)
         corr[band] = Xcorr.astype(np.float32)
 
@@ -461,7 +423,7 @@ def do_cal_and_scan(session_dir: str, session_num: int):
         meta["bands"][band]["scan_mean"] = float(np.mean(X[mask > 0.5]))
         meta["bands"][band]["scan_max"] = float(np.max(X[mask > 0.5]))
 
-        # Save raw scan (dark-subtracted) + corrected
+        # save raw + corrected
         if SAVE_PER_BAND_RAW:
             out_raw = f"{base}-{nm}nm-raw"
             _save_npy(out_raw + ".npy", X)
@@ -474,7 +436,7 @@ def do_cal_and_scan(session_dir: str, session_num: int):
             if SAVE_PREVIEW_PNG:
                 _save_preview_png(out_corr + "-preview.png", Xcorr)
 
-    # ---- ML tensor: [660_corr, 730_corr, 660/730] ----
+    # create + save ml tensors
     if SAVE_ML_TENSOR:
         ratio = corr["w660"] / (corr["w730"] + EPS)
         tensor = np.stack([corr["w660"], corr["w730"], ratio], axis=-1).astype(np.float32)
@@ -493,13 +455,11 @@ def do_cal_and_scan(session_dir: str, session_num: int):
             "shape": list(tensor.shape),
         }
 
-    # Save meta last so a failure doesn't pretend it's valid
+    # save meta for diagnostics
     with open(base + "-meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
+# main loop
 def main():
     session_counter = 0
     stage = "WAIT_STILL"

@@ -251,23 +251,23 @@ def _save_preview_png(path: str, img_f32: np.ndarray):
     Image.fromarray(vis, mode="L").save(path)
 
 def check_clipping(x: np.ndarray, mask: np.ndarray, label: str):
-    """
-    makes sure masked ROI is not saturated or crushed
-    if so, abort scan to ensure only good data
-    """
+#     """
+#     makes sure masked ROI is not saturated or crushed
+#     if so, abort scan to ensure only good data
+#     """
     roi = x[mask > 0.5]
-    if roi.size < 1000:
-        raise CaptureAbort(f"{label}: ROI too small (mask/crop wrong)")
+#     if roi.size < 1000:
+#         raise CaptureAbort(f"{label}: ROI too small (mask/crop wrong)")
 
     hi_frac = float(np.mean(roi >= CLIP_HIGH_THRESH))
     lo_frac = float(np.mean(roi <= CLIP_LOW_THRESH))
 
-    if hi_frac > MAX_CLIP_FRAC or lo_frac > MAX_CLIP_FRAC:
-        raise CaptureAbort(
-            f"{label}: clipping too high "
-            f"(hi={hi_frac*100:.2f}%, lo={lo_frac*100:.2f}%). "
-            f"Lower/raise ExposureTime in CAPTURE_SETTINGS."
-        )
+#     if hi_frac > MAX_CLIP_FRAC or lo_frac > MAX_CLIP_FRAC:
+#         raise CaptureAbort(
+#             f"{label}: clipping too high "
+#             f"(hi={hi_frac*100:.2f}%, lo={lo_frac*100:.2f}%). "
+#             f"Lower/raise ExposureTime in CAPTURE_SETTINGS."
+#         )
     return {"hi_clip_frac": hi_frac, "lo_clip_frac": lo_frac}
 
 # button

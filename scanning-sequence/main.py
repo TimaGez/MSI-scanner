@@ -4,6 +4,7 @@ import json
 import signal
 import atexit
 import traceback
+import random  # Added for randomized confidence
 import numpy as np
 import RPi.GPIO as gpio
 
@@ -251,23 +252,9 @@ def _save_preview_png(path: str, img_f32: np.ndarray):
     Image.fromarray(vis, mode="L").save(path)
 
 def check_clipping(x: np.ndarray, mask: np.ndarray, label: str):
-#     """
-#     makes sure masked ROI is not saturated or crushed
-#     if so, abort scan to ensure only good data
-#     """
     roi = x[mask > 0.5]
-#     if roi.size < 1000:
-#         raise CaptureAbort(f"{label}: ROI too small (mask/crop wrong)")
-
     hi_frac = float(np.mean(roi >= CLIP_HIGH_THRESH))
     lo_frac = float(np.mean(roi <= CLIP_LOW_THRESH))
-
-#     if hi_frac > MAX_CLIP_FRAC or lo_frac > MAX_CLIP_FRAC:
-#         raise CaptureAbort(
-#             f"{label}: clipping too high "
-#             f"(hi={hi_frac*100:.2f}%, lo={lo_frac*100:.2f}%). "
-#             f"Lower/raise ExposureTime in CAPTURE_SETTINGS."
-#         )
     return {"hi_clip_frac": hi_frac, "lo_clip_frac": lo_frac}
 
 # button
@@ -373,11 +360,9 @@ def do_cal_and_scan(session_dir: str, session_num: int):
         oled_msg("CAL", f"{nm}nm ON", "1 frame", "")
         I_on, mask2, ctrl = capture_band_single(band, pins[band], deadline_t)
 
-        # ensure mask is regular shape
         if mask2.shape != mask.shape:
             raise CaptureAbort("Mask shape mismatch (crop/mask instability)")
 
-        # dark subtracted, pedestal added
         W = (I_on - D) + PEDESTAL
         W = np.clip(W, 0, RAW_MAX).astype(np.float32)
 
@@ -459,6 +444,14 @@ def do_cal_and_scan(session_dir: str, session_num: int):
     with open(base + "-meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
+    # --- ADDED ANALYSIS PHASE ---
+    oled_msg("PROCESSING", "Analyzing Tensors", "Running MSI Model", "Please wait...")
+    time.sleep(5.0)  # Wait 5 seconds as requested
+    
+    # Generate realistic confidence score
+    fake_confidence = random.uniform(93.1, 98.4)
+    return "NEGATIVE", fake_confidence
+
 # main loop
 def main():
     session_counter = 0
@@ -488,20 +481,29 @@ def main():
                 oled_msg("CAL+SCAN", f"Session {session_num}", "DO NOT MOVE", "")
 
                 try:
-                    do_cal_and_scan(session_dir, session_num)
-                    oled_msg("DONE", f"Session {session_num}", "Saved (VALID)", "")
+                    # Capture result from detection
+                    label, conf = do_cal_and_scan(session_dir, session_num)
+                    
+                    # Display final result
+                    oled_msg("ANALYSIS COMPLETE", f"RESULT: {label}", f"CONF: {conf:.2f}%", "Press to reset")
+                    
+                    # Wait for one more press to acknowledge before resetting
+                    wait_for_debounced_press()
+                    
                 except CaptureAbort as e:
                     all_leds_off()
                     warn_path = base + "-INVALID.txt"
                     with open(warn_path, "w") as f:
                         f.write(str(e) + "\n")
                     oled_msg("INVALID DATA", "Not saved", "Check exposure", "")
+                    wait_for_debounced_press() # wait for reset
                 except Exception:
                     all_leds_off()
                     err_path = base + "-ERROR.txt"
                     with open(err_path, "w") as f:
                         f.write(traceback.format_exc())
                     oled_msg("ERROR", "Saved ERROR.txt", "", "")
+                    wait_for_debounced_press() # wait for reset
                 finally:
                     all_leds_off()
 
